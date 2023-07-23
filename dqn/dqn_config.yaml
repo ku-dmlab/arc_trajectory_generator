@@ -26,8 +26,8 @@ train:
   beta1: 0.9
   beta2: 0.95
   tau: 0.005
-  epsilon: 0.2
-  dec_epsilon: 0.00005
+  epsilon: 0.5
+  dec_epsilon: 0.00003
   min_epsilon: 0.1
   gamma: 0.99
   gpu_num: 0

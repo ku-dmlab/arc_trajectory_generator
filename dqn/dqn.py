@@ -96,27 +96,37 @@ class DQN:
         self.action_indices = [i for i in range(self.n_actions)]
         self.learn_steps_count = 0
 
-        self.q_online = GPT_DQNCritic(cfg).to(self.device)
-        self.q_target = GPT_DQNCritic(cfg).to(self.device)
-        self.q_target.load_state_dict(self.q_online.state_dict())
+        self.q_online_1 = GPT_DQNCritic(cfg).to(self.device)
+        self.q_online_2 = GPT_DQNCritic(cfg).to(self.device)
+        self.q_target_1 = GPT_DQNCritic(cfg).to(self.device)
+        self.q_target_2 = GPT_DQNCritic(cfg).to(self.device)
+        self.q_target_1.load_state_dict(self.q_online_1.state_dict())
+        self.q_target_2.load_state_dict(self.q_online_2.state_dict())
         self.buffer = HindsightExperienceReplayBuffer(self.device)
 
-        self.optimizer = self.q_online.configure_optimizers()
+        self.optimizer_1 = self.q_online_1.configure_optimizers()
+        self.optimizer_2 = self.q_online_2.configure_optimizers()
         self.loss = torch.nn.MSELoss()
 
         self.env = env
         self.cfg = cfg
         self.logger = logger
 
+        self.target_entropy = 0.3 * -np.log(1/self.n_actions)
+        self.log_alpha = torch.full([], -5., requires_grad=True, device=self.device)
+        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=self.learning_rate)
+
     def decrement_epsilon(self):
         self.epsilon = (self.epsilon - self.dec_epsilon 
                         if self.epsilon > self.min_epsilon else self.min_epsilon)
 
     def soft_update_target(self):
-        for target_param, param in zip(self.q_target.parameters(), self.q_online.parameters()):
+        for target_param, param in zip(self.q_target_1.parameters(), self.q_online_1.parameters()):
+            target_param.data.copy_(target_param.data * (1.0 - self.tau) + param.data * self.tau)
+        for target_param, param in zip(self.q_target_2.parameters(), self.q_online_2.parameters()):
             target_param.data.copy_(target_param.data * (1.0 - self.tau) + param.data * self.tau)
 
-    def log_action(self, action, timestep):
+    def log_action(self, action, timestep, tag="train"):
         pixel = action // self.env.num_actions
         is_obj = action % self.env.num_actions // (self.env.num_actions // 2)
         row, col = pixel // self.cfg.env.grid_x, pixel % self.cfg.env.grid_y
@@ -128,22 +138,36 @@ class DQN:
         self.logger.log(
             timestep,
             {
-                "greedy_action/pixel_row": row,
-                "greedy_action/pixel_col": col,
-                "greedy_action/is_obj": is_obj,
-                "greedy_action/is_translate": is_translate,
-                "greedy_action/action_arg": action_arg,
+                f"{tag}_action/pixel_row": row,
+                f"{tag}_action/pixel_col": col,
+                f"{tag}_action/is_obj": is_obj,
+                f"{tag}_action/is_translate": is_translate,
+                f"{tag}_action/action_arg": action_arg,
             },
         )
 
     @torch.no_grad()
-    def greedy_action(self, state_color, state_object, goal_color, goal_object):
+    def select_action(self, state_color, state_object, goal_color, goal_object, deterministic):
         state_color = torch.tensor(state_color[None], dtype=torch.float).to(self.device)
         state_object = torch.tensor(state_object[None], dtype=torch.float).to(self.device)
         goal_color = torch.tensor(goal_color[None], dtype=torch.float).to(self.device)
         goal_object = torch.tensor(goal_object[None], dtype=torch.float).to(self.device)
-        actions = self.q_online.forward(state_color, state_object, goal_color, goal_object)
-        return torch.argmax(actions).item()
+        action_logits, action, _, _ = self.q_online_1.forward(state_color, state_object, goal_color, goal_object)
+        if deterministic:
+            return torch.argmax(action_logits).item()
+        else:
+            return action.item()
+        
+    @torch.no_grad()
+    def optimal_action(self, state_color, state_object, goal_color, goal_object):
+        state_color = torch.tensor(state_color[None], dtype=torch.float).to(self.device).repeat(self.n_actions, 1)
+        state_object = torch.tensor(state_object[None], dtype=torch.float).to(self.device).repeat(self.n_actions, 1)
+        goal_color = torch.tensor(goal_color[None], dtype=torch.float).to(self.device).repeat(self.n_actions, 1)
+        goal_object = torch.tensor(goal_object[None], dtype=torch.float).to(self.device).repeat(self.n_actions, 1)
+        cur_action = torch.arange(self.n_actions).to(self.device)
+        cur_after_color, _ = self.env.batch_step(state_color, state_object, cur_action)
+        rewards = (cur_after_color == goal_color).float().sum(1)
+        return rewards.argmax().item()
 
     def _rollout(self, timestep):
         state_color, state_object = self.env.reset()
@@ -155,10 +179,10 @@ class DQN:
 
         for t in range(self.cfg.train.max_ep_len):
             if np.random.random() > self.epsilon:
-                action = self.greedy_action(state_color, state_object, goal_color, goal_object)
-                self.log_action(action, timestep + t)
+                action = self.select_action(state_color, state_object, goal_color, goal_object, deterministic=False)
+                self.log_action(action, timestep + t, tag="train")
             else:
-                action = np.random.choice(self.n_actions)
+                action = self.optimal_action(state_color, state_object, goal_color, goal_object)
             self.decrement_epsilon()
 
             next_state_color, next_state_object, reward, done = self.env.step(action)
@@ -176,7 +200,6 @@ class DQN:
             state_color, state_object = next_state_color, next_state_object
 
             if done:
-                print("success!")
                 break
         return t + 1, ep_return, transitions, done
 
@@ -194,7 +217,9 @@ class DQN:
 
             eval_actions = {}
             for t in range(self.cfg.train.max_ep_len):
-                action = self.greedy_action(state_color, state_object, goal_color, goal_object)
+                action = self.select_action(state_color, state_object, goal_color, goal_object, deterministic=True)
+                self.log_action(action, global_t + sum(ep_lens) + t, tag="eval")
+
                 next_state_color, next_state_object, reward, done = self.env.step(action)
                 ep_return += float(reward)
                 eval_actions[f"eval/eval_action_{t}"] = action
@@ -256,55 +281,85 @@ class DQN:
     def save(self, direc):
         os.makedirs(direc, exist_ok=True)
         OmegaConf.save(self.cfg, os.path.join(direc, "config.yaml"))
-        torch.save(self.q_online.state_dict(), os.path.join(direc, "qnet.pt"))
+        torch.save(self.q_online_1.state_dict(), os.path.join(direc, "qnet.pt"))
 
 
     def _train(self, t):
         if self.buffer.counter < self.batch_size:
             return
-        self.optimizer.zero_grad()
+        self.optimizer_1.zero_grad()
+        self.optimizer_2.zero_grad()
 
-        (state_color, state_object, action, reward, next_state_color, next_state_object, 
+        (state_color, state_object, _, reward, next_state_color, next_state_object, 
          done, goal_color, goal_object) = self.buffer.get_random_experience(self.batch_size)
         # Gets the evenly spaced batches
+        # afterstate value and next action probs
 
-        q_pred = self.q_online.forward(state_color, state_object, goal_color, goal_object)
-        q_pred = torch.gather(q_pred, 1, action.unsqueeze(1)).squeeze()
+        alpha = self.log_alpha.exp()
+        _, cur_action, cur_logprob, q_prev = self.q_online_1.forward(state_color, state_object, goal_color, goal_object)
         with torch.no_grad():
-            q_pred_next = self.q_online.forward(next_state_color, next_state_object, goal_color, goal_object)
-            next_actions = torch.argmax(q_pred_next, dim=-1, keepdims=True)
-            q_next = self.q_target.forward(next_state_color, next_state_object, goal_color, goal_object)
-            q_next = torch.gather(q_next, 1, next_actions).squeeze()
+            cur_after_color, cur_after_object = self.env.batch_step(state_color, state_object, cur_action)
+            _, _, _, cur_after_value = self.q_online_1.forward(cur_after_color, cur_after_object, goal_color, goal_object)
 
-        q_target = reward + self.gamma * q_next * (1 - done)
+            prev_reward = (state_color == goal_color).float().mean(1) - 1 + (state_color == goal_color).all(1).float()
+            cur_value = (q_prev - prev_reward) / self.gamma
+        advantage = (cur_after_value - cur_value - alpha * cur_logprob - alpha).detach()
+        # subtracting cur_val - is it ok?
+        # if it is not ok - somehow get reward, and use v(s) = (q_prev - r_prev) / gamma
+        #advantage = advantage - advantage.mean() # normalizing to help policy update
+        policy_loss = -(advantage * cur_logprob).mean()
 
-        # Computes loss and performs backpropagation
-        loss = self.loss(q_target, q_pred)
+
+        _, next_action, next_logprob, next_value_1 = self.q_online_1.forward(next_state_color, next_state_object, goal_color, goal_object)
+        _, _, _, next_value_2 = self.q_online_2.forward(next_state_color, next_state_object, goal_color, goal_object)
+
+        with torch.no_grad():
+            next_after_color, next_after_object = self.env.batch_step(next_state_color, next_state_object, next_action)
+            _, _, _, next_after_value_1 = self.q_target_1.forward(next_after_color, next_after_object, goal_color, goal_object)
+            _, _, _, next_after_value_2 = self.q_target_2.forward(next_after_color, next_after_object, goal_color, goal_object)
+            target = reward + self.gamma * (1-done) * (torch.min(next_after_value_1, next_after_value_2) - alpha * next_logprob)
+        
+        critic_loss = self.loss(target, next_value_1) + self.loss(target, next_value_2)
+
+        loss = policy_loss + critic_loss
+
+        self.alpha_optim.zero_grad()
+        alpha_loss = - (self.log_alpha * (cur_logprob + self.target_entropy).detach()).mean()
+        alpha_loss.backward()
+        self.alpha_optim.step()
 
         self.logger.log(
             t,
             {
-                "target/mean": torch.mean(q_target).item(),
-                "target/min": torch.min(q_target).item(),
-                "target/max": torch.max(q_target).item(),
-            },
-        )
-        self.logger.log(
-            t,
-            {
-                "online/mean": torch.mean(q_pred).item(),
-                "online/min": torch.min(q_pred).item(),
-                "online/max": torch.max(q_pred).item(),
-            },
-        )
-        self.logger.log(
-            t,
-            {
-                "loss": loss.item(),
-            },
+                "policy/cur_aftval_mean": torch.mean(cur_after_value).item(),
+                "policy/cur_aftval_min": torch.min(cur_after_value).item(),
+                "policy/cur_aftval_max": torch.max(cur_after_value).item(),
+                "policy/cur_val_mean": torch.mean(cur_value).item(),
+                "policy/cur_val_min": torch.min(cur_value).item(),
+                "policy/cur_val_max": torch.max(cur_value).item(),
+                "policy/logprob_mean": torch.mean(cur_logprob).item(),
+                "policy/logprob_min": torch.min(cur_logprob).item(),
+                "policy/logprob_max": torch.max(cur_logprob).item(),
+                "policy/adv_mean": torch.mean(advantage).item(),
+                "policy/adv_min": torch.min(advantage).item(),
+                "policy/adv_max": torch.max(advantage).item(),
+                "target/mean": torch.mean(target).item(),
+                "target/min": torch.min(target).item(),
+                "target/max": torch.max(target).item(),
+                "online/mean": torch.mean(next_value_1).item(),
+                "online/min": torch.min(next_value_1).item(),
+                "online/max": torch.max(next_value_1).item(),
+                "online/alpha": alpha.item(),
+                "loss/loss": loss.item(),
+                "loss/policy_loss": policy_loss.item(),
+                "loss/critic_loss": critic_loss.item(),
+                "loss/alpha_loss": alpha_loss.item()
+            }
         )
 
         loss.backward()
-        torch.nn.utils.clip_grad.clip_grad_norm_(self.q_online.parameters(), 10.0)
-        self.optimizer.step()
+        torch.nn.utils.clip_grad.clip_grad_norm_(self.q_online_1.parameters(), 10.0)
+        torch.nn.utils.clip_grad.clip_grad_norm_(self.q_online_2.parameters(), 10.0)
+        self.optimizer_1.step()
+        self.optimizer_2.step()
         self.soft_update_target()

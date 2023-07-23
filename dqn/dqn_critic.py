@@ -47,7 +47,6 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        #att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -85,10 +84,12 @@ class GPT_DQNCritic(nn.Module):
         self.cfg = cfg
 
         self.num_pixel = cfg.env.grid_x * cfg.env.grid_y
+        self.num_tokens = self.num_pixel + 1
 
         self.pos_emb = nn.Parameter(torch.zeros(1, self.num_pixel, cfg.model.n_embd))
         self.goal_emb = nn.Parameter(torch.zeros(1, 1, cfg.model.n_embd))
         self.state_emb = nn.Parameter(torch.zeros(1, 1, cfg.model.n_embd))
+        self.critic_emb = nn.Parameter(torch.zeros(1, 1, cfg.model.n_embd))
         self.drop = nn.Dropout(cfg.model.embd_pdrop)
 
         # transformer
@@ -97,6 +98,7 @@ class GPT_DQNCritic(nn.Module):
         # decoder head
         self.ln_f = nn.LayerNorm(cfg.model.n_embd)
         self.head_action = nn.Linear(cfg.model.n_embd, cfg.env.num_actions)
+        self.head_critic = nn.Linear(cfg.model.n_embd, 1)
 
         self.color_encoder = nn.Embedding(cfg.env.num_colors, cfg.model.n_embd)
         self.obj_encoder = nn.Embedding(self.num_pixel, cfg.model.n_embd)
@@ -147,6 +149,7 @@ class GPT_DQNCritic(nn.Module):
                     no_decay.add(fpn)
 
         decay.add('pos_emb')
+        decay.add('critic_emb')
         decay.add('goal_emb')
         decay.add('state_emb')
 
@@ -180,10 +183,18 @@ class GPT_DQNCritic(nn.Module):
         obj_embeddings = self.obj_encoder(goal_objects.type(torch.long)) # batch_size, num_pixels, n_embd
         goal_embedding = color_embeddings + self.pos_emb + self.goal_emb # + obj_embedding
 
-        inputs = torch.cat([state_embedding, goal_embedding], axis=1)
+        critic_embed = torch.tile(self.critic_emb, [batch_size, 1, 1])
+
+        inputs = torch.cat([state_embedding, critic_embed, goal_embedding], axis=1)
         x = self.drop(inputs)
         x = self.blocks(x)
         x = self.ln_f(x)
-        values = self.head_action(x[:, :self.num_pixel]).view(batch_size, -1)
+        #values = self.head_action(torch.cat([x[:, :self.num_pixel], x[:, self.num_pixel:]], axis=2)).view(batch_size, -1)
+        action_logits = self.head_action(x[:, :self.num_pixel]).view(batch_size, -1)
+        value = self.head_critic(x[:, self.num_pixel]).view(batch_size)
 
-        return values
+        action_dist = Categorical(logits=action_logits)
+        action = action_dist.sample()
+        action_logprob = action_dist.log_prob(action)
+
+        return action_logits, action, action_logprob, value

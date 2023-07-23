@@ -3,6 +3,7 @@ import os
 import random
 import numpy as np
 from enum import Enum
+import torch
 
 NUM_COLORS = 10
 DEFAULT_COLOR = 0
@@ -16,6 +17,8 @@ class Direction(Enum):
     DOWN = 1
     LEFT = 2
     RIGHT = 3
+
+TRANSLATE_TORCH = torch.LongTensor([[-1, 0], [1, 0], [0, -1], [0, 1]]).cuda()
 
 class MiniArcEnv:
     def __init__(self, initial, goal, initial_obj, goal_obj, use_reward_shaping=True):
@@ -56,6 +59,59 @@ class MiniArcEnv:
             return self.translate(selected_rows, selected_cols, action_arg)
         else:
             return self.select_fill(selected_rows, selected_cols, action_arg - len(Direction))
+
+    @torch.no_grad()
+    def batch_step(self, color, object, action):
+
+        batch_size = color.shape[0]
+        color = color.view(batch_size, self.max_rows, self.max_cols)
+        object = object.view(batch_size, self.max_rows, self.max_cols)
+
+        pixel = action // self.num_actions
+        is_obj = action % self.num_actions // (len(Direction) + NUM_COLORS)
+        row, col = pixel // self.max_rows, pixel % self.max_rows
+        
+        obj_index = object[torch.arange(batch_size), row, col]
+        obj_select = (object == obj_index[:, None, None])
+        
+        pixel_select = torch.zeros_like(obj_select)
+        pixel_select[torch.arange(batch_size), row, col] = True
+
+        select = torch.where(is_obj[:, None, None].bool(), obj_select, pixel_select)
+        action_arg = action % (self.num_actions // 2)
+        is_translate = action_arg < len(Direction)
+
+        # do translate action
+        select_indices = torch.nonzero(select)
+        translate_direc = action_arg % len(Direction)
+        selected_batches = select_indices[:, 0]
+        target = select_indices.clone()
+        target[:, 1:] += TRANSLATE_TORCH[translate_direc[selected_batches]]
+        row_excluder = torch.logical_and(target[:, 1] >= 0, target[:, 1] < self.max_rows)
+        col_excluder = torch.logical_and(target[:, 2] >= 0, target[:, 2] < self.max_cols)
+        excluder = torch.logical_and(row_excluder, col_excluder)
+
+        moved = select_indices[excluder]
+        target = target[excluder]
+
+        translated_color = color.clone()
+        temp = color[moved.unbind(1)]
+        translated_color[select_indices.unbind(1)] = DEFAULT_COLOR
+        translated_color[target.unbind(1)] = temp
+        
+        translated_object = object.clone()
+        temp = object[moved.unbind(1)]
+        translated_object[select_indices.unbind(1)] = DEFAULT_COLOR
+        translated_object[target.unbind(1)] = temp
+        # do recolor action
+
+        filled_color = color.clone()
+        filled_color[select] = (action_arg[selected_batches] - len(Direction)).float()
+
+        res_color = torch.where(is_translate[:, None, None], translated_color, filled_color).view(batch_size, -1)
+        res_object = torch.where(is_translate[:, None, None], translated_object, object).view(batch_size, -1)
+    
+        return res_color, res_object
 
     def translate(self, selected_rows, selected_cols, direction):
         self.state = self.state.copy()
@@ -214,3 +270,44 @@ class TestEnv2:
     def get_args(cls):
         return cls.INITIAL.copy(), cls.GOAL.copy(), cls.OBJ_MAP.copy()
 
+def test_batch_step():
+    from tqdm import trange
+    num_tests = 10000
+    batch_size = 100
+    num_rows = 5
+    num_cols = 5
+    num_colors = 10
+    num_objects = num_rows * num_cols
+    num_actions = num_rows * num_cols * 28
+
+    env = MiniArcEnv(*TestEnv1.get_args())
+
+    for _ in trange(num_tests):
+        state_color = np.random.randint(num_colors, size=(batch_size, num_rows, num_cols))
+        state_object = np.random.randint(num_objects, size=(batch_size, num_rows, num_cols))
+        action = np.random.randint(num_actions, size=(batch_size))
+
+        step_colors, step_objects = [], []
+        for s_col, s_obj, act in zip(state_color, state_object, action):
+            env.state = s_col
+            env.obj = s_obj
+            step_color, step_object, _, _ = env.step(act)
+            step_colors.append(step_color.reshape(num_rows, num_cols))
+            step_objects.append(step_object.reshape(num_rows, num_cols))
+        step_colors = np.stack(step_colors)
+        step_objects = np.stack(step_objects)
+
+
+        batch_step_color, batch_step_object = env.batch_step(
+            torch.tensor(state_color).float().cuda(), 
+            torch.tensor(state_object).float().cuda(), 
+            torch.tensor(action).long().cuda())
+        batch_step_color = batch_step_color.detach().cpu().numpy().reshape(batch_size, num_rows, num_cols)
+        batch_step_object = batch_step_object.detach().cpu().numpy().reshape(batch_size, num_rows, num_cols)
+
+        assert (batch_step_color == step_colors).all()
+        assert (batch_step_object == step_objects).all()
+
+
+if __name__ == "__main__":
+    test_batch_step()

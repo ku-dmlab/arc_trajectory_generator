@@ -1,0 +1,12 @@
+{
+    "files.watcherExclude": {
+        "**/.git/**": true,
+        "**/ICLR_DT/**": true,
+        "**/outputs/**": true
+    },
+    "[python]": {
+        "editor.defaultFormatter": "ms-python.black-formatter"
+    },
+    "python.formatting.provider": "black",
+    "editor.formatOnSave": false,
+}
