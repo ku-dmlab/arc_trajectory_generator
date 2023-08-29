@@ -79,7 +79,7 @@ class Block(nn.Module):
 class GPT_DQNCritic(nn.Module):
     """  the full GPT language model, with a context size of block_size """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, env):
         super().__init__()
         self.cfg = cfg
 
@@ -97,8 +97,9 @@ class GPT_DQNCritic(nn.Module):
 
         # decoder head
         self.ln_f = nn.LayerNorm(cfg.model.n_embd)
-        self.head_action = nn.Linear(cfg.model.n_embd, cfg.env.num_actions)
+        self.head_local_action = nn.Linear(cfg.model.n_embd, env.num_local_actions)
         self.head_critic = nn.Linear(cfg.model.n_embd, 1)
+        self.head_global_action = nn.Linear(cfg.model.n_embd, env.num_global_actions)
 
         self.color_encoder = nn.Embedding(cfg.env.num_colors, cfg.model.n_embd)
         self.obj_encoder = nn.Embedding(self.num_pixel, cfg.model.n_embd)
@@ -172,7 +173,7 @@ class GPT_DQNCritic(nn.Module):
         return optimizer
 
     # state, action, and return
-    def forward(self, state_colors, state_objs, goal_colors, goal_objects):
+    def forward(self, state_colors, state_objs, goal_colors):
 
         batch_size = state_colors.shape[0]
         color_embeddings = self.color_encoder(state_colors.type(torch.long)) # batch_size, num_pixels, n_embd
@@ -180,7 +181,6 @@ class GPT_DQNCritic(nn.Module):
         state_embedding = color_embeddings + obj_embeddings + self.pos_emb + self.state_emb
 
         color_embeddings = self.color_encoder(goal_colors.type(torch.long))
-        obj_embeddings = self.obj_encoder(goal_objects.type(torch.long)) # batch_size, num_pixels, n_embd
         goal_embedding = color_embeddings + self.pos_emb + self.goal_emb # + obj_embedding
 
         critic_embed = torch.tile(self.critic_emb, [batch_size, 1, 1])
@@ -190,8 +190,10 @@ class GPT_DQNCritic(nn.Module):
         x = self.blocks(x)
         x = self.ln_f(x)
         #values = self.head_action(torch.cat([x[:, :self.num_pixel], x[:, self.num_pixel:]], axis=2)).view(batch_size, -1)
-        action_logits = self.head_action(x[:, :self.num_pixel]).view(batch_size, -1)
+        action_local_logits = self.head_local_action(x[:, :self.num_pixel]).view(batch_size, -1)
         value = self.head_critic(x[:, self.num_pixel]).view(batch_size)
+        action_global_logits = self.head_global_action(x[:, self.num_pixel]).view(batch_size, -1)
+        action_logits = torch.cat([action_local_logits, action_global_logits], axis=1)
 
         action_dist = Categorical(logits=action_logits)
         action = action_dist.sample()

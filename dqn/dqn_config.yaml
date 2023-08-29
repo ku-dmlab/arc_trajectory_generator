@@ -3,10 +3,23 @@ env:
   grid_x: 5
   grid_y: 5
   num_colors: 10
-  num_actions: 28 # should get it from env
-  project_dir: "/home/bjlee/arc_exp"
-  train_paths: ["ICLR_DT/ARC_Data/diagonal_flip/train", "ICLR_DT/ARC_Data/gravity/train", "ICLR_DT/ARC_Data/stretch/train", "ICLR_DT/ARC_Data/tetris/train"]
-  test_paths: ["ICLR_DT/ARC_Data/diagonal_flip/test", "ICLR_DT/ARC_Data/gravity/test", "ICLR_DT/ARC_Data/stretch/test", "ICLR_DT/ARC_Data/tetris/test"]
+  default_color: 0
+  default_obj: 0
+  arc_local_actions: ["Translate", "Fill", "Rotate", "Flip"]
+  arc_global_actions: ["Rotate", "Flip"]
+  penalize_actions: ["Fill"]
+  project_dir: "/home/bjlee/arc_trajectory_generator"
+  train_paths: [
+    "/home/bjlee/arc_exp/ICLR_DT/ARC_Data/diagonal_flip/train", 
+    "/home/bjlee/arc_exp/ICLR_DT/ARC_Data/gravity/train", 
+    "/home/bjlee/arc_exp/ICLR_DT/ARC_Data/stretch/train", 
+    "/home/bjlee/arc_exp/ICLR_DT/ARC_Data/tetris/train"
+    ]
+  test_paths: [
+    "/home/bjlee/arc_exp/ICLR_DT/ARC_Data/diagonal_flip/test",
+    "/home/bjlee/arc_exp/ICLR_DT/ARC_Data/gravity/test",
+    "/home/bjlee/arc_exp/ICLR_DT/ARC_Data/stretch/test",
+    "/home/bjlee/arc_exp/ICLR_DT/ARC_Data/tetris/test"]
 
 model:
   n_layer: 16
@@ -15,6 +28,8 @@ model:
   embd_pdrop: 0.1
   resid_pdrop: 0.1
   attn_pdrop: 0.1
+
+seed: 0
 
 train:
   total_timesteps: 1000000
