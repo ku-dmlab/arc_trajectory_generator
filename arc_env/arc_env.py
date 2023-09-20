@@ -32,6 +32,7 @@ class ActionSpec:
 
 class MiniArcEnv:
     def __init__(self, cfg, initial, goal, initial_obj):
+        self.cfg = cfg
         self.num_colors = cfg.env.num_colors
         self.default_color = cfg.env.default_color
         self.grid_x = cfg.env.grid_x
@@ -44,7 +45,7 @@ class MiniArcEnv:
 
         self.num_pixels = self.grid_y * self.grid_x
 
-        self.penalize_actions = [getattr(actions, name)(cfg) for name in cfg.env.penalize_actions]
+        self.penalize_actions = [(list(cfg.env.arc_local_actions) + list(cfg.env.arc_global_actions)).index(name) for name in cfg.env.penalize_actions]
         (
             self.action_specs,
             self.action_types,
@@ -89,7 +90,7 @@ class MiniArcEnv:
         cols = jnp.array([spec.pixel_col for spec in action_specs])
         is_obj = jnp.array([spec.is_object for spec in action_specs])
         is_global = jnp.array([spec.is_global for spec in action_specs])
-        penalize = jnp.array([spec.action_obj in self.penalize_actions for spec in action_specs])
+        penalize = jnp.array([self.list_actions.index(spec.action_obj) in self.penalize_actions for spec in action_specs])
         return action_specs, types, args, rows, cols, is_obj, is_global, penalize
 
     def get_action_log(self, action, tag):
@@ -175,7 +176,7 @@ class MiniArcEnv:
         penalty = self.action_penalize[action.ravel()]
         next_state = next_state.reshape(-1, self.grid_y, self.grid_x)
         goal = goal.reshape(-1, self.grid_y, self.grid_x)
-        return (next_state == goal).mean([1, 2]) + (next_state == goal).all([1, 2]) - 1 - penalty
+        return (next_state == goal).mean([1, 2]) + (next_state == goal).all([1, 2]) * self.cfg.env.finish_reward - 1 - penalty * self.cfg.env.penality_reward
 
     @partial(jit, static_argnums=(0,))
     def batch_done(self, next_state, goal):
@@ -309,6 +310,7 @@ class DataBasedARCEnv(MiniArcEnv):
 
     def batch_reward(self, state, action, next_state, goal):
         reward = super().batch_reward(state, action, next_state, goal)
+        return reward
         if self.state_actions is None:
             return reward
         traj_state_action = self.state_actions

@@ -2,6 +2,8 @@
 ICLR_DT/
 ppo/
 outputs/
+outputs_dqn/
+outputs_embedder/
 ICLR_DT.tar.gz
 
 # Byte-compiled / optimized / DLL files

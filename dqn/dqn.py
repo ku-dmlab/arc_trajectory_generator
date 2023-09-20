@@ -120,14 +120,12 @@ class DQN:
     def __init__(self, env, cfg, logger, device):
         self.device = device
         self.learning_rate = cfg.train.learning_rate
-        self.n_actions = env.num_actions * cfg.env.grid_x * cfg.env.grid_y
         self.tau = cfg.train.tau
         self.gamma = cfg.train.gamma
         self.epsilon = cfg.train.epsilon
         self.batch_size = cfg.train.batch_size
         self.dec_epsilon = cfg.train.dec_epsilon
         self.min_epsilon = cfg.train.min_epsilon
-        self.action_indices = [i for i in range(self.n_actions)]
         self.learn_steps_count = 0
 
         self.q_online_1 = GPT_DQNCritic(cfg, env).to(self.device)
@@ -146,7 +144,7 @@ class DQN:
         self.cfg = cfg
         self.logger = logger
 
-        self.target_entropy = 0.3 * -np.log(1 / self.n_actions)
+        self.target_entropy = 0.3 * -np.log(1 / self.env.num_actions)
         self.log_alpha = torch.full([], -5.0, requires_grad=True, device=self.device)
         self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=self.learning_rate)
 
@@ -195,8 +193,10 @@ class DQN:
                     state_color, state_object, goal_color, deterministic=False
                 )
                 self.log_action(action, timestep + t, tag="train")
-            else:
+            elif np.random.random() > 0.5:
                 action = self.env.get_optimal_action(state_color, state_object, goal_color).item()
+            else:
+                action = np.random.choice(self.env.num_actions)
             self.decrement_epsilon()
 
             next_state_color, next_state_object, reward, done = self.env.step(action)

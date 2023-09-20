@@ -8,6 +8,8 @@ env:
   arc_local_actions: ["Translate", "Fill", "Rotate", "Flip"]
   arc_global_actions: ["Rotate", "Flip"]
   penalize_actions: ["Fill"]
+  finish_reward: 10
+  penality_reward: 1
   project_dir: "/home/bjlee/arc_trajectory_generator"
   train_paths: [
     "/home/bjlee/arc_exp/ICLR_DT/ARC_Data/diagonal_flip/train", 
@@ -42,7 +44,7 @@ train:
   beta2: 0.95
   tau: 0.005
   epsilon: 0.5
-  dec_epsilon: 0.00003
+  dec_epsilon: 0.00001
   min_epsilon: 0.1
   gamma: 0.99
   gpu_num: 0
