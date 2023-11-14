@@ -35,7 +35,7 @@ train:
   total_timesteps: 1000000
   max_ep_len: 100
   learning_rate: 0.0005
-  batch_size: 64
+  batch_size: 32
   save_cycle: 50
   weight_decay: 0.1
   beta1: 0.9
@@ -48,7 +48,7 @@ train:
   gpu_num: 0
 
 logging:
-  logging_dir: "exps/"
+  logging_dir: "/workspaces/bjlee/arc_trajectory_generator/exps/"
   exp_type: "dqn"
   print_data: False
   use_tb: True

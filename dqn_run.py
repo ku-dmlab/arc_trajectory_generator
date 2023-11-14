@@ -1,40 +1,41 @@
-import torch
-a = torch.zeros(5).cuda()
+
 import os
 import datetime
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-from tqdm import trange
 
+import numpy as np
+import gymnasium as gym
 import hydra
 from omegaconf import DictConfig
+
+import foarcle
+from arcle.loaders import Loader
 from dqn.dqn import DQN
-from arc_env.arc_env import MiniArcEnv, DataBasedARCEnv
+from utils.util import get_device
 from utils.logger import Logger
 
-import cProfile
+class TestLoader(Loader):
 
-MAX_ROW = 5
-MAX_COL = 5
-NUM_ACTIONS = 28
+    def __init__(self, size_x, size_y, **kwargs):
+        self.size_x = size_x
+        self.size_y = size_y
+        
+        self.rng = np.random.default_rng(12345)
+        super().__init__(**kwargs)
 
+    def get_path(self, **kwargs):
+        return ['']
 
-def print_state(state):
-    for row in state.reshape(MAX_ROW, MAX_COL):
-        print(" ".join([str(each) for each in row]))
+    def parse(self, **kwargs):
+        ti= np.zeros((self.size_x,self.size_y), dtype=np.uint8)
+        to = np.zeros((self.size_x,self.size_y), dtype=np.uint8)
+        ei = np.zeros((self.size_x,self.size_y), dtype=np.uint8)
+        eo = np.zeros((self.size_x,self.size_y), dtype=np.uint8)
 
-
-def get_device(gpu_num):
-    print(gpu_num)
-    if gpu_num is not None and torch.cuda.is_available():
-        device = torch.device(f"cuda:{gpu_num}")
-        torch.cuda.empty_cache()
-        print("Device set to : " + str(torch.cuda.get_device_name(device)))
-    else:
-        device = torch.device("cpu")
-        print("Device set to : cpu")
-    return device
+        ti[0:self.size_x, 0:self.size_y] = self.rng.integers(0,10, size=[self.size_x,self.size_y])
+        to[0:self.size_x, 0:self.size_y] = self.rng.integers(0,10, size=[self.size_x,self.size_y])
+        ei[0:self.size_x, 0:self.size_y] = self.rng.integers(0,10, size=[self.size_x,self.size_y])
+        eo[0:self.size_x, 0:self.size_y] = self.rng.integers(0,10, size=[self.size_x,self.size_y])
+        return [([ti],[to],[ei],[eo], {'desc': "just for test"})]
 
 
 @hydra.main(config_path="dqn", config_name="dqn_config")
@@ -48,8 +49,11 @@ def main(cfg: DictConfig) -> None:
         use_tb=cfg.logging.use_tb,
     )
 
-    # env = MiniArcEnv(*TestEnv1.get_args())
-    env = DataBasedARCEnv(cfg)
+    env = gym.make(
+        'ARCLE/FOO2ARCv2Env-v0', 
+        data_loader = TestLoader(cfg.env.grid_x, cfg.env.grid_y), 
+        max_grid_size=(cfg.env.grid_x, cfg.env.grid_y), 
+        colors=10)
 
     agent = DQN(env, cfg, logger, device)
 
