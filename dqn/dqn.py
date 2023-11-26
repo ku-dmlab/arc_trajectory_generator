@@ -1,6 +1,7 @@
 import os
 from copy import deepcopy
 
+import wandb
 import numpy as np
 import torch
 from .dqn_critic import GPT_DQNCritic
@@ -92,9 +93,7 @@ class HindsightExperienceReplayBuffer:
 
 class DQN:
 
-    NUM_OPERATIONS = 35
-
-    def __init__(self, env, cfg, logger, device):
+    def __init__(self, env, cfg, device):
         self.device = device
         self.learning_rate = cfg.train.learning_rate
         self.tau = cfg.train.tau
@@ -108,6 +107,10 @@ class DQN:
         self.q_online_2 = GPT_DQNCritic(cfg, env).to(self.device)
         self.q_target_1 = GPT_DQNCritic(cfg, env).to(self.device)
         self.q_target_2 = GPT_DQNCritic(cfg, env).to(self.device)
+        self.q_online_1 = torch.compile(self.q_online_1)
+        self.q_online_2 = torch.compile(self.q_online_2)
+        self.q_target_1 = torch.compile(self.q_target_1)
+        self.q_target_2 = torch.compile(self.q_target_2)
         self.q_target_1.load_state_dict(self.q_online_1.state_dict())
         self.q_target_2.load_state_dict(self.q_online_2.state_dict())
         self.buffer = HindsightExperienceReplayBuffer(cfg, self.device)
@@ -115,14 +118,16 @@ class DQN:
         self.optimizer_1 = self.q_online_1.configure_optimizers()
         self.optimizer_2 = self.q_online_2.configure_optimizers()
         self.loss = torch.nn.MSELoss()
+        self.aux_loss = torch.nn.MSELoss()
 
         self.env = env
         self.cfg = cfg
-        self.logger = logger
 
-        self.target_entropy = -4
-        self.log_alpha = torch.full([], -5.0, requires_grad=True, device=self.device)
-        self.alpha_optim = torch.optim.Adam([self.log_alpha], lr=self.learning_rate)
+        self.bbox_target_entropy = -4
+        self.op_target_entropy = 0.3
+        self.log_alpha_bbox = torch.full([], -1.0, requires_grad=True, device=self.device)
+        self.log_alpha_op = torch.full([], -1.0, requires_grad=True, device=self.device)
+        self.alpha_optim = torch.optim.Adam([self.log_alpha_bbox, self.log_alpha_op], lr=self.learning_rate)
 
     def decrement_epsilon(self):
         self.epsilon = (
@@ -134,12 +139,6 @@ class DQN:
             target_param.data.copy_(target_param.data * (1.0 - self.tau) + param.data * self.tau)
         for target_param, param in zip(self.q_target_2.parameters(), self.q_online_2.parameters()):
             target_param.data.copy_(target_param.data * (1.0 - self.tau) + param.data * self.tau)
-
-    def log_action(self, action, timestep, tag="train"):
-        self.logger.log(
-            timestep,
-            {f"{tag}_action": action}
-        )
 
     def flatten_and_copy(self, state):
         new_state = deepcopy(state)
@@ -153,15 +152,19 @@ class DQN:
         bbox[2] = np.clip(bbox[2], 0, self.cfg.env.grid_y)
         bbox[3] = np.clip(bbox[3], 0, self.cfg.env.grid_y)
         bbox = np.floor(bbox).astype(int)
-        selection[bbox[0]:bbox[0] + bbox[2], bbox[1]:bbox[1] + bbox[3]] = 1
+        selection[bbox[0]:bbox[0] + bbox[2] + 1, bbox[1]:bbox[1] + bbox[3] + 1] = 1
         return selection
 
     def _get_random_action(self):
-        operation = np.random.randint(35)
-        start_x = float(np.random.randint(self.cfg.env.grid_x))
-        start_y = float(np.random.randint(self.cfg.env.grid_y))
-        width = float(np.random.randint(self.cfg.env.grid_x - start_x))
-        height = float(np.random.randint(self.cfg.env.grid_y - start_y))
+        operation = np.random.randint(self.cfg.env.num_actions)
+        # start_x = float(np.random.randint(self.cfg.env.grid_x))
+        # start_y = float(np.random.randint(self.cfg.env.grid_y))
+        # width = float(np.random.randint(self.cfg.env.grid_x - start_x))
+        # height = float(np.random.randint(self.cfg.env.grid_y - start_y))
+        start_x = np.random.rand() * self.cfg.env.grid_x
+        start_y = np.random.rand() * self.cfg.env.grid_y
+        width = np.random.rand() * self.cfg.env.grid_x
+        height = np.random.rand() * self.cfg.env.grid_y
         return operation, [start_x, start_y, width, height]
 
     def _rollout(self, timestep):
@@ -178,13 +181,27 @@ class DQN:
                     operation, bbox = self.q_online_1.act(**q_input, deterministic=False)
                     operation = operation[0].detach().cpu().numpy()
                     bbox = bbox[0].detach().cpu().numpy()
-                self.log_action(operation, timestep + t, tag="train")
+                wandb.log(
+                    {"rollout/operation": operation,
+                    "rollout/bbox_0": bbox[0],
+                    "rollout/bbox_1": bbox[1],
+                    "rollout/bbox_2": bbox[2],
+                    "rollout/bbox_3": bbox[3],
+                    "rollout/rbbox_0": np.floor(np.clip(bbox[0], 0, self.cfg.env.grid_x)),
+                    "rollout/rbbox_1": np.floor(np.clip(bbox[1], 0, self.cfg.env.grid_x)),
+                    "rollout/rbbox_2": np.floor(np.clip(bbox[2], 0, self.cfg.env.grid_x)),
+                    "rollout/rbbox_3": np.floor(np.clip(bbox[3], 0, self.cfg.env.grid_x)),
+                    "train_step": timestep + t}
+                )
             else:
                 operation, bbox = self._get_random_action()
-            action = {"operation": operation, "selection": self._get_selection_from_bbox(bbox)}
+            action = {"operation": 34 if operation == 2 else operation, "selection": self._get_selection_from_bbox(bbox)}
             self.decrement_epsilon()
 
             raw_next_state, reward, done, _, _ = self.env.step(action)
+            # reward = reward - ((raw_next_state["grid"] - info["answer"]) ** 2).mean() * 0.01
+            # if done and reward == 0:
+            #     reward = -1
             ep_return += float(reward)
 
             next_state = self.flatten_and_copy(raw_next_state)
@@ -198,10 +215,10 @@ class DQN:
             state = next_state
             if done:
                 break
-        return t + 1, ep_return, transitions, done
+        return t + 1, ep_return, transitions, done, t
 
     @torch.no_grad()
-    def _eval(self, global_t):
+    def _eval(self, eval_step):
         ep_lens = []
         ep_returns = []
         for _ in range(self.cfg.logging.num_evaluations):
@@ -216,8 +233,15 @@ class DQN:
                     operation, bbox = self.q_online_1.act(**q_input, deterministic=True)
                     operation = operation[0].detach().cpu().numpy()
                     bbox = bbox[0].detach().cpu().numpy()
-                self.log_action(operation, global_t + sum(ep_lens) + t, tag="train")
-                action = {"operation": operation, "selection": self._get_selection_from_bbox(bbox)}
+                wandb.log(
+                    {"eval/operation": operation,
+                    "eval/bbox_0": bbox[0],
+                    "eval/bbox_1": bbox[1],
+                    "eval/bbox_2": bbox[2],
+                    "eval/bbox_3": bbox[3],
+                    "eval_step": eval_step + sum(ep_lens) + t}
+                )
+                action = {"operation": 34 if operation == 2 else operation, "selection": self._get_selection_from_bbox(bbox)}
 
                 raw_next_state, reward, done, _, _ = self.env.step(action)
                 ep_return += float(reward)
@@ -227,13 +251,14 @@ class DQN:
             ep_lens.append(t)
             ep_returns.append(ep_return)
 
-        self.logger.log(
-            global_t,
+        wandb.log(
             {
                 "eval/ep_len": np.mean(ep_lens),
                 "eval/ep_return": np.mean(ep_returns),
+                "eval_step": eval_step + sum(ep_lens)
             }
         )
+        return eval_step + sum(ep_lens)
 
     def _add_hindsight_experiences(self, transitions, global_t):
         answer = self.buffer.next_grid[transitions[-1]]
@@ -244,40 +269,42 @@ class DQN:
             experience["answer_dim"] = answer_dim
             
             self.buffer.add_experience(**experience)
-            self._train(global_t + t)
+            #self._train(global_t + t)
 
-            if experience["grid_dim"] == answer_dim and np.all(
-                experience["grid"][:answer_dim[0], :answer_dim[1]] == 
+            if experience["next_grid_dim"] == answer_dim and np.all(
+                experience["next_grid"][:answer_dim[0], :answer_dim[1]] == 
                 answer[:answer_dim[0], :answer_dim[1]]):
 
                 next_state = {key: value for key, value in experience.items() if "next_" in key}
                 state = {key[5:]: value for key, value in next_state.items()}
-                new_exp = experience | state | next_state | {"reward":1, "done":True, "operation": 34}
+                new_exp = experience | state | next_state | {"reward":1, "done":True, "operation": 2}
                 self.buffer.add_experience(**new_exp)
-                self._train(global_t + t)
+                #self._train(global_t + t)
                 break
 
         return t
 
     def learn(self, checkpoint_dir):
+        eval_step = 0
         t = 0
         t_logged = 0
         pbar = tqdm(total=self.cfg.train.total_timesteps)
         while t < self.cfg.train.total_timesteps:
-            len_episode, ep_ret, transitions, done = self._rollout(t)
-            self.logger.log(
-                t, {"train/done": done, "train/epsilon": self.epsilon, "train/ep_ret": ep_ret}
-            )
+            len_episode, ep_ret, transitions, done, ep_len = self._rollout(t)
+            wandb.log(
+                {"rollout/done": done, 
+                 "rollout/epsilon": self.epsilon, 
+                 "rollout/ep_ret": ep_ret, 
+                 "rollout/ep_len": ep_len,
+                 "train_step": t + len_episode - 1})
             t += len_episode
             pbar.update(len_episode)
-            if not ep_ret:
-                num_update = self._add_hindsight_experiences(transitions, t)
-                t += num_update
-                pbar.update(num_update)
+            if not ep_ret == 1:
+                self._add_hindsight_experiences(transitions, t)
 
             if t - t_logged >= self.cfg.logging.log_interval:
                 t_logged = t
-                self._eval(t)
+                eval_step = self._eval(eval_step) + 100
 
                 if checkpoint_dir is not None:
                     self.save(os.path.join(checkpoint_dir, f"checkpoint_{t}"))
@@ -301,62 +328,81 @@ class DQN:
 
         exp = self.buffer.get_random_experience(self.batch_size)
 
-        alpha = self.log_alpha.exp()
+        alpha_bbox = self.log_alpha_bbox.exp()
+        alpha_op = self.log_alpha_op.exp()
 
-        op, bbox, op_log_pi, bbox_log_pi, all_op_pi = self.q_online_1.action_and_log_pi(**{key: exp[key] for key in self.buffer.STATE_KEYS + self.buffer.INFO_KEYS})
+        op, bbox, op_log_pi, bbox_log_pi, all_op_pi = self.q_online_1.action_and_log_pi(
+            **{key: exp[key] for key in self.buffer.STATE_KEYS + self.buffer.INFO_KEYS})
 
         states = {key: exp[key] for key in self.buffer.STATE_KEYS}
         infos = {key: exp[key] for key in self.buffer.INFO_KEYS}
+        actions = {key: exp[key] for key in self.buffer.ACTION_KEYS}
         next_states = {key[5:]: exp[key] for key in self.buffer.NEXT_STATE_KEYS}
 
-        q_values, values = self.q_target_1.value(**states | infos, operation=op.detach(), bbox=bbox, pi=all_op_pi)
+        q_values, values, all_qvalues = self.q_online_1.value(**states | infos, operation=op.detach(), bbox=bbox, pi=all_op_pi)
+        detached_q, _, _ = self.q_online_1.value(**states | infos, operation=op.detach(), bbox=bbox.detach(), pi=all_op_pi.detach())
+        # To prevent gradient that directly increment Q
 
-        policy_loss = op_log_pi * (values - q_values + alpha * (op_log_pi + bbox_log_pi)).detach()
-        policy_loss += alpha * (op_log_pi + bbox_log_pi) - q_values
-        policy_loss = policy_loss.mean()
+        op_loss = (op_log_pi * (values - q_values).detach()).mean()
+        bbox_loss = (alpha_op * op_log_pi + alpha_bbox * bbox_log_pi - q_values + detached_q).mean()
+        policy_loss = op_loss + bbox_loss
 
 
-        q_value_1 = self.q_online_1.value(**{key: exp[key] for key in self.buffer.STATE_KEYS + self.buffer.INFO_KEYS + self.buffer.ACTION_KEYS})
-        q_value_2 = self.q_online_2.value(**{key: exp[key] for key in self.buffer.STATE_KEYS + self.buffer.INFO_KEYS + self.buffer.ACTION_KEYS})
+        q_value_1, cur_aux_1, cur_dist = self.q_online_1.value(**states | infos | actions)
+        q_value_2, cur_aux_2, _ = self.q_online_2.value(**states | infos | actions)
 
         with torch.no_grad():
-            next_op, next_bbox, next_op_log_pi, next_bbox_log_pi, _ = self.q_online_1.action_and_log_pi(
-                **{key: exp[key] for key in self.buffer.INFO_KEYS}, **{key[5:]: exp[key] for key in self.buffer.NEXT_STATE_KEYS})
+            next_op, next_bbox, next_op_log_pi, next_bbox_log_pi, _ = self.q_online_1.action_and_log_pi(** next_states | infos)
             
-            next_q1 = self.q_target_1.value(** next_states | infos, operation=next_op, bbox=next_bbox)
-            next_q2 = self.q_target_2.value(** next_states | infos, operation=next_op, bbox=next_bbox)
+            next_q1, next_aux_1, next_dist = self.q_target_1.value(** next_states | infos, operation=next_op, bbox=next_bbox)
+            next_q2, next_aux_2, _ = self.q_target_2.value(** next_states | infos, operation=next_op, bbox=next_bbox)
             
-            target = exp["reward"] + self.gamma * (1 - exp["done"]) * (torch.minimum(next_q1, next_q2) - alpha * (next_op_log_pi + next_bbox_log_pi))
+            target = exp["reward"] + self.gamma * (1 - exp["done"]) * (
+                torch.minimum(next_q1, next_q2) - alpha_op * next_op_log_pi - alpha_bbox * next_bbox_log_pi)
             
         critic_loss = self.loss(target.detach(), q_value_1) + self.loss(target.detach(), q_value_2)
 
-        loss = policy_loss + critic_loss
+        aux_loss = (self.aux_loss(cur_aux_1, cur_dist) 
+                    + self.aux_loss(cur_aux_2, cur_dist) 
+                    + self.aux_loss(next_aux_1, next_dist) 
+                    + self.aux_loss(next_aux_2, next_dist))
+
+        loss = policy_loss + critic_loss + aux_loss
 
         self.alpha_optim.zero_grad()
-        alpha_loss = (self.log_alpha * (self.target_entropy - op_log_pi - bbox_log_pi).detach()).mean()
+        alpha_loss = -(self.log_alpha_op * (self.op_target_entropy + op_log_pi).detach() 
+                      + self.log_alpha_bbox * (self.bbox_target_entropy + bbox_log_pi).detach()).mean()
         alpha_loss.backward()
         self.alpha_optim.step()
 
-        self.logger.log(
-            t,
+        wandb.log(
             {
-                "policy/q_value_1": torch.mean(q_value_1).item(),
-                "policy/q_value_1": torch.min(q_value_1).item(),
-                "policy/q_value_1": torch.max(q_value_1).item(),
+                "online/q_value_1_act_var": torch.var(all_qvalues, dim=1).mean().item(),
+                "online/q_value_1_mean": torch.mean(q_value_1).item(),
+                "online/q_value_1_min": torch.min(q_value_1).item(),
+                "online/q_value_1_max": torch.max(q_value_1).item(),
+                "train/alpha_bbox": alpha_bbox.item(),
+                "train/alpha_op": alpha_op.item(),
                 "target/mean": torch.mean(target).item(),
                 "target/min": torch.min(target).item(),
                 "target/max": torch.max(target).item(),
-                "online/alpha": alpha.item(),
+                "train/op_entropy": torch.mean(-op_log_pi).item(),
+                "train/bbox_entropy": torch.mean(-bbox_log_pi).item(),
+                "train/entropy": -torch.mean(op_log_pi + bbox_log_pi).item(),
                 "loss/loss": loss.item(),
+                "loss/bbox_loss": bbox_loss.item(),
+                "loss/op_loss": op_loss.item(),
                 "loss/policy_loss": policy_loss.item(),
                 "loss/critic_loss": critic_loss.item(),
                 "loss/alpha_loss": alpha_loss.item(),
-            },
+                "loss/aux_loss": aux_loss.item(),
+                "train_step": t
+            }
         )
 
         loss.backward()
-        torch.nn.utils.clip_grad.clip_grad_norm_(self.q_online_1.parameters(), 10.0)
-        torch.nn.utils.clip_grad.clip_grad_norm_(self.q_online_2.parameters(), 10.0)
+        torch.nn.utils.clip_grad.clip_grad_norm_(self.q_online_1.parameters(), 1.0)
+        torch.nn.utils.clip_grad.clip_grad_norm_(self.q_online_2.parameters(), 1.0)
         self.optimizer_1.step()
         self.optimizer_2.step()
         self.soft_update_target()

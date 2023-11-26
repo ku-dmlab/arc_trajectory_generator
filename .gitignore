@@ -1,5 +1,7 @@
 # Dataset
 ICLR_DT/
+outputs/
+exps/
 ppo/
 outputs/
 outputs_*/

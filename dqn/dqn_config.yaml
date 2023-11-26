@@ -3,6 +3,7 @@ env:
   grid_x: 5
   grid_y: 5
   num_colors: 10
+  num_actions: 3
   default_color: 0
   default_obj: 0
   arc_local_actions: ["Translate", "Fill", "Rotate", "Flip"]
@@ -34,10 +35,10 @@ seed: 0
 train:
   total_timesteps: 1000000
   max_ep_len: 100
-  learning_rate: 0.0005
+  learning_rate: 0.0001
   batch_size: 32
   save_cycle: 50
-  weight_decay: 0.1
+  weight_decay: 0.01
   beta1: 0.9
   beta2: 0.95
   tau: 0.005
