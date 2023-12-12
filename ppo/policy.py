@@ -21,7 +21,7 @@ class CausalSelfAttention(nn.Module):
     explicit implementation here to show that there is nothing too scary here.
     """
 
-    def __init__(self, cfg, num_fixed_tokens):
+    def __init__(self, cfg, num_fixed_tokens, num_all_tokens):
         super().__init__()
         assert cfg.model.n_embd % cfg.model.n_head == 0
         # key, query, value projections for all heads
@@ -37,7 +37,6 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(cfg.model.n_embd, cfg.model.n_embd)
         self.n_head = cfg.model.n_head
         self.num_fixed_tokens = num_fixed_tokens
-        num_all_tokens = num_fixed_tokens + 4
         self.register_buffer("bias", torch.tril(torch.ones(
             num_all_tokens, num_all_tokens)).view(1, 1, num_all_tokens, num_all_tokens))
         self.bias[:, :, :, :num_fixed_tokens] = 1
@@ -69,12 +68,12 @@ class CausalSelfAttention(nn.Module):
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
-    def __init__(self, cfg, num_fixed_tokens):
+    def __init__(self, cfg, num_fixed_tokens, num_all_tokens):
         super().__init__()
         self.ln1 = nn.LayerNorm(cfg.model.n_embd)
         self.ln2 = nn.LayerNorm(cfg.model.n_embd)
         self.resid_drop = nn.Dropout(cfg.model.resid_pdrop)
-        self.attn = CausalSelfAttention(cfg, num_fixed_tokens)
+        self.attn = CausalSelfAttention(cfg, num_fixed_tokens, num_all_tokens)
         self.mlp = nn.Sequential(
             nn.Linear(cfg.model.n_embd, 4 * cfg.model.n_embd),
             GELU(),
@@ -88,26 +87,33 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln2(x))
         return x, mask
 
-class GPT_DQNCritic(nn.Module):
+class GPTPolicy(nn.Module):
     """  the full GPT language model, with a context size of block_size """
 
-    def __init__(self, cfg, env):
+    def __init__(self, cfg, device):
         super().__init__()
         self.cfg = cfg
+        self.device = device
 
         self.num_pixel = cfg.env.grid_x * cfg.env.grid_y
-        self.num_fixed_tokens = self.num_pixel * 8 + 3
+        self.grid_shape = torch.tensor([self.cfg.env.grid_x, self.cfg.env.grid_y], device=self.device)
+
+        self.num_fixed_tokens = self.num_pixel * 2 + 2 # info_tkn, cls_tkn
+        self.num_action_recur = 5
+        self.num_all_tokens = self.num_fixed_tokens + self.num_action_recur
 
         self.pos_emb = nn.Parameter(torch.randn(1, self.num_pixel, cfg.model.n_embd) * 0.02)
         self.global_pos_emb = nn.Parameter(
-            torch.randn(1, self.num_fixed_tokens + 4, cfg.model.n_embd) * 0.02)
+            torch.randn(1, self.num_all_tokens, cfg.model.n_embd) * 0.02)
         self.state_emb = nn.Parameter(torch.randn(8, 1, cfg.model.n_embd) * 0.02)
         self.bbox_emb = nn.Linear(4, cfg.model.n_embd)
         self.drop = nn.Dropout(cfg.model.embd_pdrop)
         self.cls_tkn = nn.Parameter(torch.randn(1, 1, cfg.model.n_embd) * 0.02)
 
         # transformer
-        self.blocks = nn.Sequential(*[Block(cfg, self.num_fixed_tokens) for _ in range(cfg.model.n_layer)])
+        self.blocks = nn.Sequential(*[Block(
+            cfg, self.num_fixed_tokens, self.num_all_tokens
+            ) for _ in range(cfg.model.n_layer)])
 
         # decoder head
         self.ln_f = nn.LayerNorm(cfg.model.n_embd)
@@ -119,31 +125,45 @@ class GPT_DQNCritic(nn.Module):
         self.trials_encoder = nn.Embedding(4, cfg.model.n_embd)
         self.active_encoder = nn.Embedding(2, cfg.model.n_embd)
         self.rotation_encoder = nn.Embedding(4, cfg.model.n_embd)
-        self.timestep_encoder = nn.Embedding(cfg.train.max_ep_len, cfg.model.n_embd)
-
-        self.apply(self._init_weights)
-        logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
-
-        # rnn policy
-        self.head_operation = nn.Linear(cfg.model.n_embd, cfg.env.num_actions)
-        self.head_bbox_1 = nn.Linear(cfg.model.n_embd, cfg.env.grid_x)
-        self.head_bbox_2 = nn.Linear(cfg.model.n_embd, cfg.env.grid_y)
-        self.head_bbox_3 = nn.Linear(cfg.model.n_embd, cfg.env.grid_x)
-        self.head_bbox_4 = nn.Linear(cfg.model.n_embd, cfg.env.grid_y)
-        self.head_bboxes = [
-            self.head_bbox_1, self.head_bbox_2, self.head_bbox_3, self.head_bbox_4]
-        self.head_critic = nn.Linear(cfg.model.n_embd, 1)
 
         self.operation_encoder = nn.Embedding(cfg.env.num_actions, cfg.model.n_embd)
         self.bbox_encoder_1 = nn.Embedding(cfg.env.grid_x, cfg.model.n_embd)
         self.bbox_encoder_2 = nn.Embedding(cfg.env.grid_y, cfg.model.n_embd)
         self.bbox_encoder_3 = nn.Embedding(cfg.env.grid_x, cfg.model.n_embd)
+        self.bbox_encoder_4 = nn.Embedding(cfg.env.grid_x, cfg.model.n_embd)
         self.encoders = [
             self.operation_encoder, self.bbox_encoder_1,
-            self.bbox_encoder_2, self.bbox_encoder_3
+            self.bbox_encoder_2, self.bbox_encoder_3, self.bbox_encoder_4
         ]
 
-    def _init_weights(self, module):
+        self.apply(self._transformer_init_weights)
+        logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
+
+        # rnn policy
+        def linear_with_orthogonal_init(inp_dim, oup_dim, scale):
+            linear = nn.Linear(inp_dim, oup_dim)
+            torch.nn.init.orthogonal_(linear.weight, scale)
+            torch.nn.init.zeros_(linear.bias)
+            return linear
+            
+        head_factory = lambda last_dim, oup_init_scale: nn.Sequential(
+            linear_with_orthogonal_init(cfg.model.n_embd, cfg.model.n_embd, math.sqrt(2)), GELU(), 
+            linear_with_orthogonal_init(cfg.model.n_embd, cfg.model.n_embd, math.sqrt(2)), GELU(), 
+            linear_with_orthogonal_init(cfg.model.n_embd, last_dim, oup_init_scale))
+        self.head_operation = head_factory(cfg.env.num_actions, 0.01)
+        self.head_bbox_1 = head_factory(cfg.env.grid_x, 0.01)
+        self.head_bbox_2 = head_factory(cfg.env.grid_y, 0.01)
+        self.head_bbox_3 = head_factory(cfg.env.grid_x, 0.01)
+        self.head_bbox_4 = head_factory(cfg.env.grid_y, 0.01)
+        self.head_aux_reward = head_factory(1, 1)
+        self.head_bboxes = [
+            self.head_bbox_1, self.head_bbox_2, self.head_bbox_3, self.head_bbox_4, self.head_aux_reward]
+        self.head_critic = head_factory(1, 1)
+        self.head_aux_rtm1 = head_factory(1, 1)
+
+        assert len(self.encoders) == self.num_action_recur == len(self.head_bboxes)
+
+    def _transformer_init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding, nn.Parameter)):
             module.weight.data.normal_(mean=0.0, std=0.02)
             if isinstance(module, nn.Linear) and module.bias is not None:
@@ -203,7 +223,7 @@ class GPT_DQNCritic(nn.Module):
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
 
-        optimizer = torch.optim.AdamW(optim_groups, lr=self.cfg.train.learning_rate, betas=(self.cfg.train.beta1, self.cfg.train.beta2))
+        optimizer = torch.optim.AdamW(optim_groups, lr=self.cfg.train.base_lr, betas=(self.cfg.train.beta1, self.cfg.train.beta2))
 
         return optimizer
 
@@ -213,27 +233,43 @@ class GPT_DQNCritic(nn.Module):
                 additional_tokens):
 
         B = grid.shape[0]
-
         def compute_mask(base, end_dim, start_dim=None):
-            active = torch.ones_like(base)
-            if not (end_dim <=5).all() or not (end_dim >= 0).all():
-                print(end_dim)
-            for i in range(B):
-                if start_dim is None:
-                    active[i, :end_dim[i, 0], :end_dim[i, 1]] = 0
-                else:
-                    active[i, 
-                    start_dim[i, 0]:start_dim[i, 0] + end_dim[i, 0],
-                    start_dim[i, 1]:start_dim[i, 1] + end_dim[i, 1]] = 0
-            return active.reshape(B, -1)
-    
+
+            if start_dim is None:
+                active = torch.ones_like(base)
+                tran = torch.zeros_like(end_dim)
+                tran[:, 0] = end_dim[:, 0] - self.cfg.env.grid_x
+                tran[:, 1] = end_dim[:, 1] - self.cfg.env.grid_y
+                active = core_translate(active, tran)
+            else:
+                active = torch.ones_like(base)
+                tran = torch.zeros_like(end_dim)
+                tran[:, 0] = torch.minimum(start_dim[:, 0] + end_dim[:, 0] - self.cfg.env.grid_x, torch.zeros_like(start_dim[:, 0]))
+                tran[:, 1] = torch.minimum(start_dim[:, 1] + end_dim[:, 1] - self.cfg.env.grid_y, torch.zeros_like(start_dim[:, 0]))
+                active = core_translate(active, tran)
+
+                opposite = torch.ones_like(base)
+                tran[:, 0] = - start_dim[:, 0]
+                tran[:, 1] = - start_dim[:, 1]
+                opposite = core_translate(opposite, tran)
+
+                opposite = torch.flip(opposite, [1, 2])
+                active = torch.logical_and(active, opposite)
+            return (~active.bool()).reshape(B, -1)
+
+        def core_translate(base, pos):
+            translate = torch.eye(2, 2, device=self.device)[None].tile(B, 1, 1)
+            rate = - torch.flip(pos * 2 / self.grid_shape, [1])[..., None]
+            translate = torch.concat([translate, rate], axis=2)
+            ff = torch.nn.functional.affine_grid(translate, [B, 1, self.cfg.env.grid_x, self.cfg.env.grid_y], align_corners=False)
+            res = torch.nn.functional.grid_sample(
+                base.reshape([B, 1, self.cfg.env.grid_x, self.cfg.env.grid_y]).float(), ff, align_corners=False).round().long().squeeze(1)
+            return res
+
         def translate(base, pos):
-            ret = torch.zeros_like(base)
-            for i in range(B):
-                target_x = slice(None) if pos[i, 0] == 0 else slice(None, -pos[i, 0])
-                target_y = slice(None) if pos[i, 1] == 0 else slice(None, -pos[i, 1])
-                ret[i, pos[i, 0]:, pos[i, 1]:] = base[i, target_x, target_y]
-            return ret
+            pos[:, 0] = torch.remainder(pos[:, 0] + self.cfg.env.grid_x, self.cfg.env.grid_x)
+            pos[:, 1] = torch.remainder(pos[:, 1] + self.cfg.env.grid_y, self.cfg.env.grid_y)
+            return core_translate(base, pos)
         
 
         active_grid = compute_mask(grid, grid_dim)
@@ -280,18 +316,24 @@ class GPT_DQNCritic(nn.Module):
 
         additional_tokens = [
             each.reshape(-1, 1, self.cfg.model.n_embd) for each in additional_tokens]
+        # inputs = torch.cat([
+        #     grid, selected, clip, object, 
+        #     object_sel, background, input, answer, info_tkn, 
+        #     cls_tkn] + additional_tokens, axis=1)
         inputs = torch.cat([
-            grid, selected, clip, object, 
-            object_sel, background, input, answer, info_tkn, 
-            cls_tkn] + additional_tokens, axis=1)
+            grid, answer, info_tkn, cls_tkn] + additional_tokens, axis=1)
         
         inputs = inputs + self.global_pos_emb[:, :inputs.shape[1]]
 
+        # masks = torch.cat([
+        #     active_grid, active_grid, active_clip, active_obj,
+        #     active_obj, active_grid + 1 - active.reshape(-1, 1), active_inp, active_ans, 
+        #     torch.zeros((len(active_grid), 2 + len(additional_tokens)),
+        #                  device=self.device)], axis=1)
         masks = torch.cat([
-            active_grid, active_grid, active_clip, active_obj,
-            active_obj, active_grid + 1 - active.reshape(-1, 1), active_inp, active_ans, 
+            active_grid, active_ans, 
             torch.zeros((len(active_grid), 2 + len(additional_tokens)),
-                         device=active_grid.device)], axis=1)
+                         device=self.device)], axis=1)
 
         x = self.drop(inputs)
         x, _ = self.blocks((x, masks.bool()))
@@ -302,7 +344,8 @@ class GPT_DQNCritic(nn.Module):
     def act(self, **kwargs):
         
         x = self.forward(**kwargs, additional_tokens=[])
-        value = self.head_critic(x[:, -1])
+        value = self.head_critic(x[:, -1]).squeeze(1)
+        rtm1_pred = self.head_aux_rtm1(x[:, -1]).squeeze(1)
 
         dist = Categorical(logits=self.head_operation(x[:, -1]))
         operation = sample = dist.sample()
@@ -310,34 +353,39 @@ class GPT_DQNCritic(nn.Module):
 
         additional_tokens = []
         bbox = []
-        for encoder, head in zip(self.encoders, self.head_bboxes):
+        for i, (encoder, head) in enumerate(zip(self.encoders, self.head_bboxes)):
             additional_tokens.append(encoder(sample))
             x = self.forward(**kwargs, additional_tokens=additional_tokens)
-            dist = Categorical(logits=head(x[:, -1]))
-            sample = dist.sample()
-            log_prob += dist.log_prob(sample)
-            bbox.append(sample)
-        return operation, torch.concatenate(bbox), log_prob, value
+            if i != self.num_action_recur - 1:
+                dist = Categorical(logits=head(x[:, -1]))
+                sample = dist.sample()
+                log_prob += dist.log_prob(sample)
+                bbox.append(sample)
+            else:
+                r_pred = head(x[:, -1]).squeeze(1)
+        return operation, torch.stack(bbox, dim=1), -log_prob, value, rtm1_pred, r_pred
 
     def evaluate(self, operation, bbox_pos, bbox_dim, **kwargs):
         additional_tokens = [
             self.operation_encoder(operation),
             self.bbox_encoder_1(bbox_pos[:, 0]),
             self.bbox_encoder_2(bbox_pos[:, 1]),
-            self.bbox_encoder_3(bbox_dim[:, 0])
+            self.bbox_encoder_3(bbox_dim[:, 0]),
+            self.bbox_encoder_4(bbox_dim[:, 1])
         ]
         x = self.forward(**kwargs, additional_tokens=additional_tokens)
-        value = self.head_critic(x[:, -5])
+        vpred = self.head_critic(x[:, -1 - self.num_action_recur]).squeeze(1)
+        rtm1_pred = self.head_aux_rtm1(x[:, -1 - self.num_action_recur]).squeeze(1)
 
-        operation_dist = Categorical(logits=self.head_operation(x[:, -5]))
+        operation_dist = Categorical(logits=self.head_operation(x[:, -1 - self.num_action_recur]))
         log_prob = operation_dist.log_prob(operation.squeeze())
         entropy = operation_dist.entropy()
 
         bbox_logits = [
-            self.head_bbox_1(x[:, -4]),
-            self.head_bbox_2(x[:, -3]),
-            self.head_bbox_3(x[:, -2]),
-            self.head_bbox_4(x[:, -1]),
+            self.head_bbox_1(x[:, -5]),
+            self.head_bbox_2(x[:, -4]),
+            self.head_bbox_3(x[:, -3]),
+            self.head_bbox_4(x[:, -2]),
         ]
         bbox_dist = [Categorical(logits=each) for each in bbox_logits]
 
@@ -345,5 +393,6 @@ class GPT_DQNCritic(nn.Module):
         for i, dist in enumerate(bbox_dist):
             log_prob += dist.log_prob(bbox[:, i])
             entropy += dist.entropy()
+        r_pred = self.head_aux_reward(x[:, -1]).squeeze(1)
 
-        return log_prob, value, entropy
+        return -log_prob, vpred, entropy, rtm1_pred, r_pred

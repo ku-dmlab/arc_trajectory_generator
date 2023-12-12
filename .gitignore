@@ -2,7 +2,6 @@
 ICLR_DT/
 outputs/
 exps/
-ppo/
 outputs/
 outputs_*/
 ICLR_DT.tar.gz
