@@ -127,10 +127,10 @@ class GPTPolicy(nn.Module):
         self.rotation_encoder = nn.Embedding(4, cfg.model.n_embd)
 
         self.operation_encoder = nn.Embedding(cfg.env.num_actions, cfg.model.n_embd)
-        self.bbox_encoder_1 = nn.Embedding(cfg.env.grid_x, cfg.model.n_embd)
-        self.bbox_encoder_2 = nn.Embedding(cfg.env.grid_y, cfg.model.n_embd)
-        self.bbox_encoder_3 = nn.Embedding(cfg.env.grid_x, cfg.model.n_embd)
-        self.bbox_encoder_4 = nn.Embedding(cfg.env.grid_x, cfg.model.n_embd)
+        self.bbox_encoder_1 = nn.Sequential(nn.Linear(1, cfg.model.n_embd), GELU())
+        self.bbox_encoder_2 = nn.Sequential(nn.Linear(1, cfg.model.n_embd), GELU())
+        self.bbox_encoder_3 = nn.Sequential(nn.Linear(1, cfg.model.n_embd), GELU())
+        self.bbox_encoder_4 = nn.Sequential(nn.Linear(1, cfg.model.n_embd), GELU())
         self.encoders = [
             self.operation_encoder, self.bbox_encoder_1,
             self.bbox_encoder_2, self.bbox_encoder_3, self.bbox_encoder_4
@@ -151,10 +151,10 @@ class GPTPolicy(nn.Module):
             linear_with_orthogonal_init(cfg.model.n_embd, cfg.model.n_embd, math.sqrt(2)), GELU(), 
             linear_with_orthogonal_init(cfg.model.n_embd, last_dim, oup_init_scale))
         self.head_operation = head_factory(cfg.env.num_actions, 0.01)
-        self.head_bbox_1 = head_factory(cfg.env.grid_x, 0.01)
-        self.head_bbox_2 = head_factory(cfg.env.grid_y, 0.01)
-        self.head_bbox_3 = head_factory(cfg.env.grid_x, 0.01)
-        self.head_bbox_4 = head_factory(cfg.env.grid_y, 0.01)
+        self.head_bbox_1 = head_factory(2, 0.01)
+        self.head_bbox_2 = head_factory(2, 0.01)
+        self.head_bbox_3 = head_factory(2, 0.01)
+        self.head_bbox_4 = head_factory(2, 0.01)
         self.head_aux_reward = head_factory(1, 1)
         self.head_bboxes = [
             self.head_bbox_1, self.head_bbox_2, self.head_bbox_3, self.head_bbox_4, self.head_aux_reward]
@@ -354,10 +354,14 @@ class GPTPolicy(nn.Module):
         additional_tokens = []
         bbox = []
         for i, (encoder, head) in enumerate(zip(self.encoders, self.head_bboxes)):
-            additional_tokens.append(encoder(sample))
+            additional_tokens.append(encoder(sample.reshape(-1, 1)))
             x = self.forward(**kwargs, additional_tokens=additional_tokens)
             if i != self.num_action_recur - 1:
-                dist = Categorical(logits=head(x[:, -1]))
+                output = head(x[:, -1])
+                dist = TruncatedNormal(
+                    torch.nn.functional.sigmoid(output[:, 0]), 
+                    torch.exp(torch.clamp(output[:, 1], -20, 2)),
+                    0, 1)
                 sample = dist.sample()
                 log_prob += dist.log_prob(sample)
                 bbox.append(sample)
@@ -365,13 +369,13 @@ class GPTPolicy(nn.Module):
                 r_pred = head(x[:, -1]).squeeze(1)
         return operation, torch.stack(bbox, dim=1), -log_prob, value, rtm1_pred, r_pred
 
-    def evaluate(self, operation, bbox_pos, bbox_dim, **kwargs):
+    def evaluate(self, operation, bbox, **kwargs):
         additional_tokens = [
             self.operation_encoder(operation),
-            self.bbox_encoder_1(bbox_pos[:, 0]),
-            self.bbox_encoder_2(bbox_pos[:, 1]),
-            self.bbox_encoder_3(bbox_dim[:, 0]),
-            self.bbox_encoder_4(bbox_dim[:, 1])
+            self.bbox_encoder_1(bbox[:, 0].reshape(-1, 1)),
+            self.bbox_encoder_2(bbox[:, 1].reshape(-1, 1)),
+            self.bbox_encoder_3(bbox[:, 2].reshape(-1, 1)),
+            self.bbox_encoder_4(bbox[:, 3].reshape(-1, 1))
         ]
         x = self.forward(**kwargs, additional_tokens=additional_tokens)
         vpred = self.head_critic(x[:, -1 - self.num_action_recur]).squeeze(1)
@@ -387,12 +391,15 @@ class GPTPolicy(nn.Module):
             self.head_bbox_3(x[:, -3]),
             self.head_bbox_4(x[:, -2]),
         ]
-        bbox_dist = [Categorical(logits=each) for each in bbox_logits]
+        bbox_dist = [TruncatedNormal(
+                    torch.nn.functional.sigmoid(each[:, 0]), 
+                    torch.exp(torch.clamp(each[:, 1], -20, 2)),
+                    0, 1) for each in bbox_logits]
 
-        bbox = torch.concatenate([bbox_pos, bbox_dim], axis=1)
         for i, dist in enumerate(bbox_dist):
             log_prob += dist.log_prob(bbox[:, i])
-            entropy += dist.entropy()
+            assert entropy.shape == dist.entropy.shape
+            entropy += dist.entropy
         r_pred = self.head_aux_reward(x[:, -1]).squeeze(1)
 
         return -log_prob, vpred, entropy, rtm1_pred, r_pred

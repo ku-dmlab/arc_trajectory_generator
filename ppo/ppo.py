@@ -47,7 +47,7 @@ def learn(cfg, env):
 
         # Get minibatch
         print("Rollout:")
-        ob_acs, returns, values, neglogpacs, rtm1, rtm1_pred, norm_rew, rpred, ep_rets = runner.run()
+        ob_acs, returns, values, neglogpacs, rtm1, rtm1_pred, norm_rew, rpred, ep_rets, success_ts, ebbox = runner.run()
         advs = returns - values
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
 
@@ -94,21 +94,29 @@ def learn(cfg, env):
             # or if it's just worse than predicting nothing (ev =< 0)
             ev = max(1 - np.var(npy(returns) - npy(values))/np.var(npy(returns)), -1)
             ev_aux_rtm1 = max(1 - np.var(npy(rtm1) - npy(rtm1_pred))/np.var(npy(rtm1)), -1)
-            ev_aux_rew = max(1 - np.var(npy(rtm1) - npy(rpred))/np.var(npy(rtm1)), -1)
+            ev_aux_rew = max(1 - np.var(npy(norm_rew) - npy(rpred))/np.var(npy(norm_rew)), -1)
+            ev_aux_rew_on_rtm1 = max(1 - np.var(npy(norm_rew) - npy(rpred))/np.var(npy(norm_rew) - npy(rtm1_pred)), -1)
             wandb.log(
                 {
                     "rollout/operation": npy(ob_acs["operation"]),
-                    "rollout/bbox_0": npy(ob_acs["bbox_pos"][:, 0]),
-                    "rollout/bbox_1": npy(ob_acs["bbox_pos"][:, 1]),
-                    "rollout/bbox_2": npy(ob_acs["bbox_dim"][:, 0]),
-                    "rollout/bbox_3": npy(ob_acs["bbox_dim"][:, 1]),
+                    "rollout/bbox_0": npy(ob_acs["bbox"][:, 0]),
+                    "rollout/bbox_1": npy(ob_acs["bbox"][:, 1]),
+                    "rollout/bbox_2": npy(ob_acs["bbox"][:, 2]),
+                    "rollout/bbox_3": npy(ob_acs["bbox"][:, 3]),
+                    "rollout/ebbox_0": ebbox[:, 0],
+                    "rollout/ebbox_1": ebbox[:, 1],
+                    "rollout/ebbox_2": ebbox[:, 2],
+                    "rollout/ebbox_3": ebbox[:, 3],
                     "misc/serial_timesteps": update * tcfg.nsteps,
                     "misc/nupdates": update,
                     "misc/total_timesteps": update * nbatch, 
                     "explained_variance": float(ev),
                     "explained_variance_aux_rtm1": float(ev_aux_rtm1),
                     "explained_variance_aux_rew": float(ev_aux_rew),
+                    "explained_variance_aux_rew_on_rtm1": float(ev_aux_rew_on_rtm1),
                     'eprewmean': safemean(all_ep_rets),
+                    'success_ts': safemean(success_ts),
+                    'success_rate': safemean(np.array(success_ts) > 0),
                     'lr': scheduler.get_lr()[0],
                     'loss/loss': lossvals[0],
                     'loss/pg_loss': lossvals[1],

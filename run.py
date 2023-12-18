@@ -40,23 +40,24 @@ class TestLoader(Loader):
         return [([ti],[to],[ei],[eo], {'desc': "just for test"})]
 
 
-@hydra.main(config_path="ppo", config_name="ppo_config")
+@hydra.main(config_path="ppo", config_name="ppo_config_random")
 def main(cfg: DictConfig) -> None:
     wandb.init(
         project="arc_traj_gen",
         config=OmegaConf.to_container(cfg)
     )
-
-    # env = gym.make(
-    #     'ARCLE/FOO2ARCv2Env-v0', 
-    #     data_loader = TestLoader(cfg.env.grid_x, cfg.env.grid_y), 
-    #     max_grid_size=(cfg.env.grid_x, cfg.env.grid_y), 
-    #     colors=cfg.env.num_colors)
-    env = gym.make(
-        'ARCLE/FOO2ARCv2Env-v0', 
-        data_loader = SizeConstrainedLoader(10), 
-        max_grid_size=(10, 10), 
-        colors=cfg.env.num_colors)
+    if cfg.env.use_arc:
+        env = gym.make(
+            'ARCLE/FOO2ARCv2Env-v0', 
+            data_loader = SizeConstrainedLoader(cfg.env.grid_x), 
+            max_grid_size=(cfg.env.grid_x, cfg.env.grid_y), 
+            colors=cfg.env.num_colors)
+    else:
+        env = gym.make(
+            'ARCLE/FOO2ARCv2Env-v0', 
+            data_loader = TestLoader(cfg.env.grid_x, cfg.env.grid_y), 
+            max_grid_size=(cfg.env.grid_x, cfg.env.grid_y), 
+            colors=cfg.env.num_colors)
 
     learn(cfg, env)
 

@@ -12,7 +12,7 @@ class Runner:
     TUPLES = [
         "input_dim", "answer_dim", "grid_dim", 
         "clip_dim", "object_dim", "object_pos",
-        "bbox_pos", "bbox_dim"]
+        "bbox", "ebbox"]
     NUMBERS = [
         "terminated", "trials_remain",
         "active", "rotation_parity",
@@ -24,7 +24,7 @@ class Runner:
                   "terminated", "trials_remain", "active",
                   "object", "object_sel", "object_dim", "object_pos", 
                   "background", "rotation_parity"]
-    ACTION_KEYS = ["operation", "bbox_pos", "bbox_dim"]
+    ACTION_KEYS = ["operation", "bbox"]
 
     def __init__(self, env, cfg, device, act_fn):
         self.env = env
@@ -51,28 +51,33 @@ class Runner:
             getattr(self, key).append(np.stack(state_infos[key]))
         self.timesteps = np.zeros(self.cfg.train.nenvs)
         self.sum_rewards = np.zeros(self.cfg.train.nenvs)
+        self.success = np.zeros(self.cfg.train.nenvs)
         self.disc_sum_rewards = np.zeros(self.cfg.train.nenvs)
 
-        rewards = self._augmented_reward()
+        rewards, _ = self._augmented_reward()
         self.rtm1.append(rewards)
 
     def _get_selection_from_bbox(self, bboxes):
         selection = np.zeros((len(bboxes), self.cfg.env.grid_x, self.cfg.env.grid_y)).astype(np.uint8)
-        bboxes[:, 0] = np.clip(bboxes[:, 0], 0, self.cfg.env.grid_x)
-        bboxes[:, 1] = np.clip(bboxes[:, 1], 0, self.cfg.env.grid_y)
-        bboxes[:, 2] = np.clip(bboxes[:, 2], 0, self.cfg.env.grid_x)
-        bboxes[:, 3] = np.clip(bboxes[:, 3], 0, self.cfg.env.grid_y)
+        mult = np.array([self.cfg.env.grid_x * 2 - 1, self.cfg.env.grid_y * 2 - 1, self.cfg.env.grid_x, self.cfg.env.grid_y])
+        bias = np.array([1 - self.cfg.env.grid_x, 1 - self.cfg.env.grid_y, 0, 0])
+        bboxes = bboxes * mult + bias
+        bboxes[:, (2, 3)] = bboxes[:, (2, 3)] + bboxes[:, (0, 1)] + 1
+        bboxes[:, (0, 2)] = np.clip(bboxes[:, (0, 2)], 0, self.cfg.env.grid_x - 1e-3)
+        bboxes[:, (1, 3)] = np.clip(bboxes[:, (1, 3)], 0, self.cfg.env.grid_y - 1e-3)
         bboxes = np.floor(bboxes).astype(np.uint8)
         for i, bbox in enumerate(bboxes):
             selection[i, bbox[0]:bbox[0] + bbox[2] + 1, bbox[1]:bbox[1] + bbox[3] + 1] = 1
-        return selection
+        return selection, bboxes
 
     def _augmented_reward(self):
         rewards = []
+        success = []
         for g, ad, a in zip(self.grid[-1], self.answer_dim[-1], self.answer[-1]):
             dist = np.mean(g[:ad[0].item(), :ad[1].item()] != a[:ad[0], :ad[1]])
             rewards.append((dist == 0) - dist)
-        return np.array(rewards)
+            success.append((dist == 0))
+        return np.array(rewards), np.array(success)
 
     def run(self):
         lten = lambda x: torch.tensor(x, dtype=torch.long, device=self.device)
@@ -87,10 +92,10 @@ class Runner:
                 self.rpred.append(fnpy(rpred))
                 self.vpred.append(fnpy(vpred))
                 self.neglogpac.append(fnpy(neglogpac))
-                self.bbox_pos.append(npy(bbox[:, :2]))
-                self.bbox_dim.append(npy(bbox[:, 2:]))
+                self.bbox.append(fnpy(bbox))
                 self.operation.append(npy(operation))
-                selection = self._get_selection_from_bbox(npy(bbox))
+                selection, ebbox = self._get_selection_from_bbox(fnpy(bbox))
+                self.ebbox.append(ebbox)
 
                 # Take actions in env and look the results
                 # Infos contains a ton of useful informations
@@ -113,10 +118,11 @@ class Runner:
                 self.input.append(deepcopy(self.input[-1])); self.input_dim.append(deepcopy(self.input_dim[-1]))
                 self.answer.append(deepcopy(self.answer[-1])); self.answer_dim.append(deepcopy(self.answer_dim[-1]))
 
-                rewards = self._augmented_reward()
+                rewards, success = self._augmented_reward()
 
                 self.timesteps += 1
                 self.sum_rewards += rewards
+                self.success += success
                 self.disc_sum_rewards = self.cfg.train.gamma * self.disc_sum_rewards + rewards
                 self.ret_rms.update(self.disc_sum_rewards)
                 
@@ -128,7 +134,7 @@ class Runner:
         _, _, _, nextvalues, _, _ = self.act_fn(**policy_inp)
         nextvalues = fnpy(nextvalues)
 
-        for att in self.STATE_KEYS + self.INFO_KEYS + self.ACTION_KEYS + ["vpred", "neglogpac", "reward", "rpred", "rtm1", "rtm1_pred"]:
+        for att in self.STATE_KEYS + self.INFO_KEYS + self.ACTION_KEYS + ["vpred", "neglogpac", "reward", "rpred", "rtm1", "rtm1_pred", "ebbox"]:
             if att in self.STATE_KEYS + self.INFO_KEYS + ["rtm1"]:
                 setattr(self, att, np.stack(getattr(self, att)[:-1]))
             else:
@@ -138,7 +144,7 @@ class Runner:
         self.rew_rms.update(self.rtm1.reshape(-1))
         self.rtm1 = self.rew_rms.normalize(self.rtm1, use_mean=True)
         norm_rew =  self.rew_rms.normalize(self.reward, use_mean=True)
-        self.reward = self.ret_rms.normalize(self.reward)
+        self.reward = self.ret_rms.normalize(self.reward, use_mean=True)
 
         # discount/bootstrap off value fn
         self.returns = np.zeros_like(self.reward)
@@ -152,7 +158,8 @@ class Runner:
             advs[t] = lastgaelam = delta + self.cfg.train.gamma * self.cfg.train.lam * lastgaelam
         self.returns = advs + self.vpred
 
-        ret_ob_acs = {key: lten(sf01(getattr(self, key))) for key in self.STATE_KEYS + self.INFO_KEYS + self.ACTION_KEYS}
+        ret_ob_acs = {key: lten(sf01(getattr(self, key))) for key in self.STATE_KEYS + self.INFO_KEYS + ["operation"]}
+        ret_ob_acs = ret_ob_acs | {"bbox": ften(sf01(self.bbox))}
         ret = (
             ret_ob_acs, 
             ften(sf01(self.returns)), 
@@ -162,7 +169,9 @@ class Runner:
             ften(sf01(self.rtm1_pred)), 
             ften(sf01(norm_rew)),
             ften(sf01(self.rpred)),
-            list(self.sum_rewards))
+            list(self.sum_rewards),
+            list(self.success),
+            self.ebbox)
         self.reset()
 
         return ret
