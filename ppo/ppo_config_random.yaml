@@ -11,7 +11,7 @@ train:
   nsteps: 50
   ent_coef: 0.01
   base_lr: 3e-5
-  vf_coef: 0.5
+  vf_coef: 5
   aux_coef: 0.5
   max_grad_norm: 0.5
   gamma: 0
@@ -22,12 +22,12 @@ train:
   cliprange: 0.1
   save_interval: 0
   total_timesteps: 20000000
-  gpu_num: 0
+  gpu_num: 3
   weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
   cliprew: 10
-  update_actor_after: 100
+  update_actor_after: 50
   
 model:
   n_layer: 8

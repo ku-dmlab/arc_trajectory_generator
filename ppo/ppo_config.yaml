@@ -11,7 +11,7 @@ train:
   nsteps: 50
   ent_coef: 0.01
   base_lr: 3e-5
-  vf_coef: 0.5
+  vf_coef: 5
   aux_coef: 0.5
   max_grad_norm: 0.5
   gamma: 0
@@ -27,10 +27,10 @@ train:
   beta1: 0.9
   beta2: 0.95
   cliprew: 10
-  update_actor_after: 100
+  update_actor_after: 50
   
 model:
-  n_layer: 8
+  n_layer: 6
   n_head: 8
   n_embd: 512
   embd_pdrop: 0.1

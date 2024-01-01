@@ -8,7 +8,7 @@ from foarcle.actions.o2actions import batch_act
 class Runner:
     GRIDS = [
         "input", "answer", "grid", "selected", "clip",
-        "object", "object_sel","background"]
+        "object", "object_sel","background", "gpred", "gtp1"]
     TUPLES = [
         "input_dim", "answer_dim", "grid_dim", 
         "clip_dim", "object_dim", "object_pos",
@@ -59,15 +59,26 @@ class Runner:
 
     def _get_selection_from_bbox(self, bboxes):
         selection = np.zeros((len(bboxes), self.cfg.env.grid_x, self.cfg.env.grid_y)).astype(np.uint8)
-        mult = np.array([self.cfg.env.grid_x * 2 - 1, self.cfg.env.grid_y * 2 - 1, self.cfg.env.grid_x, self.cfg.env.grid_y])
-        bias = np.array([1 - self.cfg.env.grid_x, 1 - self.cfg.env.grid_y, 0, 0])
+        mult = np.array([self.cfg.env.grid_x, self.cfg.env.grid_y, self.cfg.env.grid_x, self.cfg.env.grid_y])
+        bias = np.array([0, 0, - self.cfg.env.grid_x // 2, - self.cfg.env.grid_y // 2])
         bboxes = bboxes * mult + bias
-        bboxes[:, (2, 3)] = bboxes[:, (2, 3)] + bboxes[:, (0, 1)] + 1
+        bboxes[:, (2, 3)] = bboxes[:, (2, 3)] + bboxes[:, (0, 1)]
         bboxes[:, (0, 2)] = np.clip(bboxes[:, (0, 2)], 0, self.cfg.env.grid_x - 1e-3)
         bboxes[:, (1, 3)] = np.clip(bboxes[:, (1, 3)], 0, self.cfg.env.grid_y - 1e-3)
-        bboxes = np.floor(bboxes).astype(np.uint8)
+        bboxes = np.floor(bboxes).astype(int)
         for i, bbox in enumerate(bboxes):
-            selection[i, bbox[0]:bbox[0] + bbox[2] + 1, bbox[1]:bbox[1] + bbox[3] + 1] = 1
+            min_x, min_y = min(bbox[0], bbox[2]), min(bbox[1], bbox[3])
+            max_x, max_y = max(bbox[0], bbox[2]), max(bbox[1], bbox[3])
+            selection[i, min_x:max_x + 1, min_y:max_y + 1] = 1
+        # mult = np.array([self.cfg.env.grid_x * 2 - 1, self.cfg.env.grid_y * 2 - 1, self.cfg.env.grid_x, self.cfg.env.grid_y])
+        # bias = np.array([1 - self.cfg.env.grid_x, 1 - self.cfg.env.grid_y, 0, 0])
+        # bboxes = bboxes * mult + bias
+        # bboxes[:, (2, 3)] = bboxes[:, (2, 3)] + bboxes[:, (0, 1)]
+        # bboxes[:, (0, 2)] = np.clip(bboxes[:, (0, 2)], 0, self.cfg.env.grid_x)
+        # bboxes[:, (1, 3)] = np.clip(bboxes[:, (1, 3)], 0, self.cfg.env.grid_y)
+        # bboxes = np.floor(bboxes).astype(int)
+        # for i, bbox in enumerate(bboxes):
+        #     selection[i, bbox[0]:bbox[2] + 1, bbox[1]:bbox[3] + 1] = 1
         return selection, bboxes
 
     def _augmented_reward(self):
@@ -87,10 +98,11 @@ class Runner:
                 # Given observations, get action value and neglopacs
                 # We already have self.obs because Runner superclass run self.obs[:] = env.reset() on init
                 policy_inp = {key: lten(getattr(self, key)[-1]) for key in self.STATE_KEYS + self.INFO_KEYS}
-                operation, bbox, neglogpac, vpred, rtm1_pred, rpred = self.act_fn(**policy_inp)
+                operation, bbox, neglogpac, vpred, rtm1_pred, rpred, gpred = self.act_fn(**policy_inp)
                 self.rtm1_pred.append(fnpy(rtm1_pred))
                 self.rpred.append(fnpy(rpred))
                 self.vpred.append(fnpy(vpred))
+                self.gpred.append(fnpy(gpred))
                 self.neglogpac.append(fnpy(neglogpac))
                 self.bbox.append(fnpy(bbox))
                 self.operation.append(npy(operation))
@@ -131,10 +143,12 @@ class Runner:
                 self.rtm1.append(rewards)
 
         policy_inp = {key: lten(getattr(self, key)[-1]) for key in self.STATE_KEYS + self.INFO_KEYS}
-        _, _, _, nextvalues, _, _ = self.act_fn(**policy_inp)
+        _, _, _, nextvalues, _, _, _ = self.act_fn(**policy_inp)
         nextvalues = fnpy(nextvalues)
 
-        for att in self.STATE_KEYS + self.INFO_KEYS + self.ACTION_KEYS + ["vpred", "neglogpac", "reward", "rpred", "rtm1", "rtm1_pred", "ebbox"]:
+        gtp1 = np.stack(self.grid[1:])
+        for att in self.STATE_KEYS + self.INFO_KEYS + self.ACTION_KEYS + [
+            "vpred", "neglogpac", "reward", "rpred", "rtm1", "rtm1_pred", "ebbox", "gpred"]:
             if att in self.STATE_KEYS + self.INFO_KEYS + ["rtm1"]:
                 setattr(self, att, np.stack(getattr(self, att)[:-1]))
             else:
@@ -169,6 +183,8 @@ class Runner:
             ften(sf01(self.rtm1_pred)), 
             ften(sf01(norm_rew)),
             ften(sf01(self.rpred)),
+            ften(sf01(self.gpred, no_prod=True)),
+            lten(sf01(gtp1)),
             list(self.sum_rewards),
             list(self.success),
             self.ebbox)
@@ -177,14 +193,16 @@ class Runner:
         return ret
 
 # obs, returns, masks, actions, values, neglogpacs, states = runner.run()
-def sf01(arr):
+def sf01(arr, no_prod=False):
     """
     swap and then flatten axes 0 and 1
     """
     s = arr.shape
-    shape = (s[0] * s[1], int(np.prod(s[2:]))) if int(np.prod(s[2:])) != 1 else (s[0] * s[1],)
-    return arr.swapaxes(0, 1).reshape(*shape)
-
+    if not no_prod:
+        shape = (s[0] * s[1], int(np.prod(s[2:]))) if int(np.prod(s[2:])) != 1 else (s[0] * s[1],)
+        return arr.swapaxes(0, 1).reshape(*shape)
+    else:
+        return arr.swapaxes(0, 1).reshape(s[0] * s[1], *s[2:])
 
 def flatten_and_copy(state):
     new_state = deepcopy(state)

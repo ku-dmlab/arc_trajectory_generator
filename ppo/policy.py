@@ -21,7 +21,7 @@ class CausalSelfAttention(nn.Module):
     explicit implementation here to show that there is nothing too scary here.
     """
 
-    def __init__(self, cfg, num_fixed_tokens, num_all_tokens):
+    def __init__(self, cfg):
         super().__init__()
         assert cfg.model.n_embd % cfg.model.n_head == 0
         # key, query, value projections for all heads
@@ -36,11 +36,6 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.proj = nn.Linear(cfg.model.n_embd, cfg.model.n_embd)
         self.n_head = cfg.model.n_head
-        self.num_fixed_tokens = num_fixed_tokens
-        self.register_buffer("bias", torch.tril(torch.ones(
-            num_all_tokens, num_all_tokens)).view(1, 1, num_all_tokens, num_all_tokens))
-        self.bias[:, :, :, :num_fixed_tokens] = 1
-        self.bias = (1 - self.bias).bool().tile(1, self.n_head, 1, 1)
 
     def forward(self, x, key_padding_mask):
         B, T, C = x.size()
@@ -54,7 +49,6 @@ class CausalSelfAttention(nn.Module):
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         #att[key_padding_mask[:, None, :, None].tile(1, self.n_head, 1, T)] = float('-inf')
         att[key_padding_mask[:, None, None, :].tile(1, self.n_head, T, 1)] = float('-inf')
-        att[self.bias[:, :, :T, :T].tile(B, 1, 1, 1)] = float('-inf')
 
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
@@ -73,7 +67,7 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(cfg.model.n_embd)
         self.ln2 = nn.LayerNorm(cfg.model.n_embd)
         self.resid_drop = nn.Dropout(cfg.model.resid_pdrop)
-        self.attn = CausalSelfAttention(cfg, num_fixed_tokens, num_all_tokens)
+        self.attn = CausalSelfAttention(cfg)
         self.mlp = nn.Sequential(
             nn.Linear(cfg.model.n_embd, 4 * cfg.model.n_embd),
             GELU(),
@@ -86,6 +80,21 @@ class Block(nn.Module):
         x = x + self.attn(self.ln1(x), key_padding_mask=mask)
         x = x + self.mlp(self.ln2(x))
         return x, mask
+
+
+class Periodic(nn.Module):
+    def __init__(self, inp_dim, n_freq, oup_dim, sigma) -> None:
+        super().__init__()
+        coefficients = torch.normal(0.0, sigma, (inp_dim, n_freq))
+        self.coefficients = nn.Parameter(coefficients)
+        self.encoder = nn.Sequential(nn.Linear(inp_dim * n_freq * 2, oup_dim), GELU())
+
+    def forward(self, x):
+        assert x.ndim == 2
+        x = 2 * torch.pi * self.coefficients[None] * x[..., None]
+        x = torch.cat([torch.cos(x), torch.sin(x)], -1).reshape(x.shape[0], -1)
+        return self.encoder(x)
+
 
 class GPTPolicy(nn.Module):
     """  the full GPT language model, with a context size of block_size """
@@ -127,14 +136,7 @@ class GPTPolicy(nn.Module):
         self.rotation_encoder = nn.Embedding(4, cfg.model.n_embd)
 
         self.operation_encoder = nn.Embedding(cfg.env.num_actions, cfg.model.n_embd)
-        self.bbox_encoder_1 = nn.Sequential(nn.Linear(1, cfg.model.n_embd), GELU())
-        self.bbox_encoder_2 = nn.Sequential(nn.Linear(1, cfg.model.n_embd), GELU())
-        self.bbox_encoder_3 = nn.Sequential(nn.Linear(1, cfg.model.n_embd), GELU())
-        self.bbox_encoder_4 = nn.Sequential(nn.Linear(1, cfg.model.n_embd), GELU())
-        self.encoders = [
-            self.operation_encoder, self.bbox_encoder_1,
-            self.bbox_encoder_2, self.bbox_encoder_3, self.bbox_encoder_4
-        ]
+        self.bbox_encoder = Periodic(4, cfg.model.n_embd // 8, cfg.model.n_embd, 0.15)
 
         self.apply(self._transformer_init_weights)
         logger.info("number of parameters: %e", sum(p.numel() for p in self.parameters()))
@@ -151,17 +153,12 @@ class GPTPolicy(nn.Module):
             linear_with_orthogonal_init(cfg.model.n_embd, cfg.model.n_embd, math.sqrt(2)), GELU(), 
             linear_with_orthogonal_init(cfg.model.n_embd, last_dim, oup_init_scale))
         self.head_operation = head_factory(cfg.env.num_actions, 0.01)
-        self.head_bbox_1 = head_factory(2, 0.01)
-        self.head_bbox_2 = head_factory(2, 0.01)
-        self.head_bbox_3 = head_factory(2, 0.01)
-        self.head_bbox_4 = head_factory(2, 0.01)
-        self.head_aux_reward = head_factory(1, 1)
-        self.head_bboxes = [
-            self.head_bbox_1, self.head_bbox_2, self.head_bbox_3, self.head_bbox_4, self.head_aux_reward]
+        self.head_bbox_mean = head_factory(4, 0.01)
+        self.head_bbox_std = head_factory(4, 0.01)
         self.head_critic = head_factory(1, 1)
         self.head_aux_rtm1 = head_factory(1, 1)
-
-        assert len(self.encoders) == self.num_action_recur == len(self.head_bboxes)
+        self.head_aux_reward = head_factory(1, 1)
+        self.head_aux_transition = head_factory(cfg.env.num_colors, 1)
 
     def _transformer_init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding, nn.Parameter)):
@@ -208,6 +205,7 @@ class GPTPolicy(nn.Module):
         no_decay.add('global_pos_emb')
         no_decay.add('state_emb')
         no_decay.add('cls_tkn')
+        no_decay.add('bbox_encoder.coefficients')
 
         # validate that we considered every parameter
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -342,64 +340,57 @@ class GPTPolicy(nn.Module):
         return x
 
     def act(self, **kwargs):
-        
+
+        # compute value, rtm1
         x = self.forward(**kwargs, additional_tokens=[])
         value = self.head_critic(x[:, -1]).squeeze(1)
         rtm1_pred = self.head_aux_rtm1(x[:, -1]).squeeze(1)
 
+        # sample operation
         dist = Categorical(logits=self.head_operation(x[:, -1]))
-        operation = sample = dist.sample()
-        log_prob = dist.log_prob(sample)
+        operation = dist.sample()
+        log_prob = dist.log_prob(operation)
+        enc_op = self.operation_encoder(operation)
 
-        additional_tokens = []
-        bbox = []
-        for i, (encoder, head) in enumerate(zip(self.encoders, self.head_bboxes)):
-            additional_tokens.append(encoder(sample.reshape(-1, 1)))
-            x = self.forward(**kwargs, additional_tokens=additional_tokens)
-            if i != self.num_action_recur - 1:
-                output = head(x[:, -1])
-                dist = TruncatedNormal(
-                    torch.nn.functional.sigmoid(output[:, 0]), 
-                    torch.exp(torch.clamp(output[:, 1], -20, 2)),
-                    0, 1)
-                sample = dist.sample()
-                log_prob += dist.log_prob(sample)
-                bbox.append(sample)
-            else:
-                r_pred = head(x[:, -1]).squeeze(1)
-        return operation, torch.stack(bbox, dim=1), -log_prob, value, rtm1_pred, r_pred
+        # sample bbox
+        x = self.forward(**kwargs, additional_tokens=[enc_op])
+        bbox_mean = torch.nn.functional.sigmoid(self.head_bbox_mean(x[:, -1]))
+        bbox_std = torch.exp(torch.clamp(self.head_bbox_std(x[:, -1]), -20, 2))
+        dist = TruncatedNormal(bbox_mean, bbox_std, 0, 1)
+        bbox = dist.sample()
+        log_prob += dist.log_prob(bbox).sum(1)
+        enc_bb = self.bbox_encoder(bbox)
+
+        x = self.forward(**kwargs, additional_tokens=[enc_op, enc_bb])
+        r_pred = self.head_aux_reward(x[:, -1]).squeeze(1)
+        g_pred = self.head_aux_transition(x[:, :self.num_pixel])
+
+        return operation, bbox, -log_prob, value, rtm1_pred, r_pred, g_pred
 
     def evaluate(self, operation, bbox, **kwargs):
-        additional_tokens = [
-            self.operation_encoder(operation),
-            self.bbox_encoder_1(bbox[:, 0].reshape(-1, 1)),
-            self.bbox_encoder_2(bbox[:, 1].reshape(-1, 1)),
-            self.bbox_encoder_3(bbox[:, 2].reshape(-1, 1)),
-            self.bbox_encoder_4(bbox[:, 3].reshape(-1, 1))
-        ]
-        x = self.forward(**kwargs, additional_tokens=additional_tokens)
-        vpred = self.head_critic(x[:, -1 - self.num_action_recur]).squeeze(1)
-        rtm1_pred = self.head_aux_rtm1(x[:, -1 - self.num_action_recur]).squeeze(1)
 
-        operation_dist = Categorical(logits=self.head_operation(x[:, -1 - self.num_action_recur]))
-        log_prob = operation_dist.log_prob(operation.squeeze())
-        entropy = operation_dist.entropy()
+        # compute value, rtm1
+        x = self.forward(**kwargs, additional_tokens=[])
+        vpred = self.head_critic(x[:, -1]).squeeze(1)
+        rtm1_pred = self.head_aux_rtm1(x[:, -1]).squeeze(1)
 
-        bbox_logits = [
-            self.head_bbox_1(x[:, -5]),
-            self.head_bbox_2(x[:, -4]),
-            self.head_bbox_3(x[:, -3]),
-            self.head_bbox_4(x[:, -2]),
-        ]
-        bbox_dist = [TruncatedNormal(
-                    torch.nn.functional.sigmoid(each[:, 0]), 
-                    torch.exp(torch.clamp(each[:, 1], -20, 2)),
-                    0, 1) for each in bbox_logits]
+        # sample operation
+        dist = Categorical(logits=self.head_operation(x[:, -1]))
+        log_prob = dist.log_prob(operation)
+        enc_op = self.operation_encoder(operation)
+        entropy = dist.entropy()
 
-        for i, dist in enumerate(bbox_dist):
-            log_prob += dist.log_prob(bbox[:, i])
-            assert entropy.shape == dist.entropy.shape
-            entropy += dist.entropy
+        # sample bbox
+        x = self.forward(**kwargs, additional_tokens=[enc_op])
+        bbox_mean = torch.nn.functional.sigmoid(self.head_bbox_mean(x[:, -1]))
+        bbox_std = torch.exp(torch.clamp(self.head_bbox_std(x[:, -1]), -20, 2))
+        dist = TruncatedNormal(bbox_mean, bbox_std, 0, 1)
+        log_prob += dist.log_prob(bbox).sum(1)
+        enc_bb = self.bbox_encoder(bbox)
+        entropy += dist.entropy.sum(1)
+
+        x = self.forward(**kwargs, additional_tokens=[enc_op, enc_bb])
         r_pred = self.head_aux_reward(x[:, -1]).squeeze(1)
+        g_pred = self.head_aux_transition(x[:, :self.num_pixel])
 
-        return -log_prob, vpred, entropy, rtm1_pred, r_pred
+        return -log_prob, vpred, entropy, rtm1_pred, r_pred, g_pred

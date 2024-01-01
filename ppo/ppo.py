@@ -47,7 +47,8 @@ def learn(cfg, env):
 
         # Get minibatch
         print("Rollout:")
-        ob_acs, returns, values, neglogpacs, rtm1, rtm1_pred, norm_rew, rpred, ep_rets, success_ts, ebbox = runner.run()
+        (ob_acs, returns, values, neglogpacs, rtm1, rtm1_pred, norm_rew, rpred, gpred, gtp1,
+         ep_rets, success_ts, ebbox) = runner.run()
         advs = returns - values
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
 
@@ -69,7 +70,8 @@ def learn(cfg, env):
                 end = start + nbatch_train
                 mbinds = inds[start:end]
                 ob_ac_slice = {key: ob_acs[key][mbinds] for key in ob_acs}
-                slices = (arr[mbinds] for arr in (returns, values, neglogpacs, advs, rtm1, norm_rew))
+                slices = (arr[mbinds] for arr in (
+                    returns, values, neglogpacs, advs, rtm1, norm_rew, gtp1))
                 train_rets.append(torch.stack(train_fn(ob_ac_slice, *slices, train_actor)))
         print("Done.")
         scheduler.step()
@@ -96,6 +98,7 @@ def learn(cfg, env):
             ev_aux_rtm1 = max(1 - np.var(npy(rtm1) - npy(rtm1_pred))/np.var(npy(rtm1)), -1)
             ev_aux_rew = max(1 - np.var(npy(norm_rew) - npy(rpred))/np.var(npy(norm_rew)), -1)
             ev_aux_rew_on_rtm1 = max(1 - np.var(npy(norm_rew) - npy(rpred))/np.var(npy(norm_rew) - npy(rtm1_pred)), -1)
+            acc_aux_gtp1 = (npy(gpred).argmax(2) == npy(gtp1)).mean()
             wandb.log(
                 {
                     "rollout/operation": npy(ob_acs["operation"]),
@@ -114,6 +117,7 @@ def learn(cfg, env):
                     "explained_variance_aux_rtm1": float(ev_aux_rtm1),
                     "explained_variance_aux_rew": float(ev_aux_rew),
                     "explained_variance_aux_rew_on_rtm1": float(ev_aux_rew_on_rtm1),
+                    "acc_aux_gtp1": float(acc_aux_gtp1),
                     'eprewmean': safemean(all_ep_rets),
                     'success_ts': safemean(success_ts),
                     'success_rate': safemean(np.array(success_ts) > 0),
@@ -124,8 +128,9 @@ def learn(cfg, env):
                     'loss/entropy_loss': lossvals[3],
                     'loss/aux_loss_rtm1': lossvals[4],
                     'loss/aux_loss_rew': lossvals[5],
-                    'loss/approxkl': lossvals[6],
-                    'loss/clipfrac': lossvals[7],
+                    'loss/aux_loss_gtp1': lossvals[6],
+                    'loss/approxkl': lossvals[7],
+                    'loss/clipfrac': lossvals[8],
                 } | logged
             )
             all_ep_rets = []
