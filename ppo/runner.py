@@ -70,15 +70,6 @@ class Runner:
             min_x, min_y = min(bbox[0], bbox[2]), min(bbox[1], bbox[3])
             max_x, max_y = max(bbox[0], bbox[2]), max(bbox[1], bbox[3])
             selection[i, min_x:max_x + 1, min_y:max_y + 1] = 1
-        # mult = np.array([self.cfg.env.grid_x * 2 - 1, self.cfg.env.grid_y * 2 - 1, self.cfg.env.grid_x, self.cfg.env.grid_y])
-        # bias = np.array([1 - self.cfg.env.grid_x, 1 - self.cfg.env.grid_y, 0, 0])
-        # bboxes = bboxes * mult + bias
-        # bboxes[:, (2, 3)] = bboxes[:, (2, 3)] + bboxes[:, (0, 1)]
-        # bboxes[:, (0, 2)] = np.clip(bboxes[:, (0, 2)], 0, self.cfg.env.grid_x)
-        # bboxes[:, (1, 3)] = np.clip(bboxes[:, (1, 3)], 0, self.cfg.env.grid_y)
-        # bboxes = np.floor(bboxes).astype(int)
-        # for i, bbox in enumerate(bboxes):
-        #     selection[i, bbox[0]:bbox[2] + 1, bbox[1]:bbox[3] + 1] = 1
         return selection, bboxes
 
     def _augmented_reward(self):

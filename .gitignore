@@ -5,6 +5,7 @@ exps/
 outputs/
 outputs_*/
 ICLR_DT.tar.gz
+.vscode
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

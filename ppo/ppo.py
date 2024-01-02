@@ -24,10 +24,6 @@ def learn(cfg, env):
     nupdates = tcfg.total_timesteps // nbatch
 
     optimizer = policy.configure_optimizers()
-    # scheduler = torch.optim.lr_scheduler.LambdaLR(
-    #     optimizer, 
-    #     lr_lambda=lambda step: 1.0 - (step - 1.0) / nupdates,
-    #     verbose=False)
     scheduler = CosineAnnealingWarmupRestarts(optimizer,
                                           first_cycle_steps=1000,
                                           cycle_mult=1.0,
