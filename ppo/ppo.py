@@ -68,12 +68,12 @@ def learn(cfg, env):
                 ob_ac_slice = {key: ob_acs[key][mbinds] for key in ob_acs}
                 slices = (arr[mbinds] for arr in (
                     returns, values, neglogpacs, advs, rtm1, norm_rew, gtp1))
-                train_rets.append(torch.stack(train_fn(ob_ac_slice, *slices, train_actor)))
+                train_rets.append(np.stack(train_fn(ob_ac_slice, *slices, train_actor)))
         print("Done.")
         scheduler.step()
         
         # Feedforward --> get losses --> update
-        lossvals = npy(torch.mean(torch.stack(train_rets), axis=0))
+        lossvals = np.mean(np.stack(train_rets), axis=0)
 
         if update % tcfg.log_interval == 0:
             watched = {"old_state_val": values, 

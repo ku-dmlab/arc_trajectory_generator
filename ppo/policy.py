@@ -394,3 +394,21 @@ class GPTPolicy(nn.Module):
         g_pred = self.head_aux_transition(x[:, :self.num_pixel])
 
         return -log_prob, vpred, entropy, rtm1_pred, r_pred, g_pred
+
+    def get_grads(self):
+        grads = []
+        for p in self.parameters():
+            if p.grad is None:
+                grads.append(torch.zeros_like(p).flatten())
+            else:
+                grads.append(p.grad.data.clone().flatten())
+        return torch.cat(grads)
+
+    def set_grads(self, new_grads):
+        start = 0
+        for p in self.parameters():
+            dims = p.shape
+            end = start + dims.numel()
+            if p.grad is not None:
+                p.grad.data = new_grads[start:end].reshape(dims)
+            start = end
