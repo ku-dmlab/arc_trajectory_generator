@@ -118,6 +118,7 @@ class GPTPolicy(nn.Module):
         self.bbox_emb = nn.Linear(4, cfg.model.n_embd)
         self.drop = nn.Dropout(cfg.model.embd_pdrop)
         self.cls_tkn = nn.Parameter(torch.randn(1, 1, cfg.model.n_embd) * 0.02)
+        self.color_action_tkn = nn.Parameter(torch.randn(1, 1, cfg.model.n_embd) * 0.02)
 
         # transformer
         self.blocks = nn.Sequential(*[Block(
@@ -152,7 +153,7 @@ class GPTPolicy(nn.Module):
             linear_with_orthogonal_init(cfg.model.n_embd, cfg.model.n_embd, math.sqrt(2)), GELU(), 
             linear_with_orthogonal_init(cfg.model.n_embd, cfg.model.n_embd, math.sqrt(2)), GELU(), 
             linear_with_orthogonal_init(cfg.model.n_embd, last_dim, oup_init_scale))
-        self.head_operation = head_factory(cfg.env.num_actions, 0.01)
+        self.head_operation = head_factory(1, 0.01)
         self.head_bbox_mean = head_factory(4, 0.01)
         self.head_bbox_std = head_factory(4, 0.01)
         self.head_critic = head_factory(1, 1)
@@ -205,6 +206,7 @@ class GPTPolicy(nn.Module):
         no_decay.add('global_pos_emb')
         no_decay.add('state_emb')
         no_decay.add('cls_tkn')
+        no_decay.add('color_action_tkn')
         no_decay.add('bbox_encoder.coefficients')
 
         # validate that we considered every parameter
@@ -311,6 +313,7 @@ class GPTPolicy(nn.Module):
             ).reshape(-1, 1, self.cfg.model.n_embd)
 
         cls_tkn = self.cls_tkn.tile(len(active_grid), 1, 1)
+        color_tkns = torch.cat([self.color_action_tkn + self.color_encoder.weight[None]]).tile(len(active_grid), 1, 1)
 
         additional_tokens = [
             each.reshape(-1, 1, self.cfg.model.n_embd) for each in additional_tokens]
@@ -319,9 +322,9 @@ class GPTPolicy(nn.Module):
         #     object_sel, background, input, answer, info_tkn, 
         #     cls_tkn] + additional_tokens, axis=1)
         inputs = torch.cat([
-            grid, answer, info_tkn, cls_tkn] + additional_tokens, axis=1)
+            grid, answer, info_tkn, color_tkns, cls_tkn] + additional_tokens, axis=1)
         
-        inputs = inputs + self.global_pos_emb[:, :inputs.shape[1]]
+        #inputs = inputs + self.global_pos_emb[:, :inputs.shape[1]]
 
         # masks = torch.cat([
         #     active_grid, active_grid, active_clip, active_obj,
@@ -330,7 +333,7 @@ class GPTPolicy(nn.Module):
         #                  device=self.device)], axis=1)
         masks = torch.cat([
             active_grid, active_ans, 
-            torch.zeros((len(active_grid), 2 + len(additional_tokens)),
+            torch.zeros((len(active_grid), 2 + self.cfg.env.num_colors + len(additional_tokens)),
                          device=self.device)], axis=1)
 
         x = self.drop(inputs)
@@ -347,15 +350,15 @@ class GPTPolicy(nn.Module):
         rtm1_pred = self.head_aux_rtm1(x[:, -1]).squeeze(1)
 
         # sample operation
-        dist = Categorical(logits=self.head_operation(x[:, -1]))
+        dist = Categorical(logits=self.head_operation(x[:, -1-self.cfg.env.num_colors:-1]).squeeze(-1))
         operation = dist.sample()
+        target_x = x[:, -1-self.cfg.env.num_colors:-1][torch.arange(len(x)), operation]
         log_prob = dist.log_prob(operation)
         enc_op = self.operation_encoder(operation)
 
         # sample bbox
-        x = self.forward(**kwargs, additional_tokens=[enc_op])
-        bbox_mean = torch.nn.functional.sigmoid(self.head_bbox_mean(x[:, -1]))
-        bbox_std = torch.exp(torch.clamp(self.head_bbox_std(x[:, -1]), -20, 2))
+        bbox_mean = torch.nn.functional.sigmoid(self.head_bbox_mean(target_x))
+        bbox_std = torch.exp(torch.clamp(self.head_bbox_std(target_x), -20, 2))
         dist = TruncatedNormal(bbox_mean, bbox_std, 0, 1)
         bbox = dist.sample()
         log_prob += dist.log_prob(bbox).sum(1)
@@ -375,15 +378,16 @@ class GPTPolicy(nn.Module):
         rtm1_pred = self.head_aux_rtm1(x[:, -1]).squeeze(1)
 
         # sample operation
-        dist = Categorical(logits=self.head_operation(x[:, -1]))
+        dist = Categorical(logits=self.head_operation(x[:, -1-self.cfg.env.num_colors:-1]).squeeze(-1))
         log_prob = dist.log_prob(operation)
+        target_x = x[:, -1-self.cfg.env.num_colors:-1][torch.arange(len(x)), operation]
         enc_op = self.operation_encoder(operation)
         entropy = dist.entropy()
 
         # sample bbox
         x = self.forward(**kwargs, additional_tokens=[enc_op])
-        bbox_mean = torch.nn.functional.sigmoid(self.head_bbox_mean(x[:, -1]))
-        bbox_std = torch.exp(torch.clamp(self.head_bbox_std(x[:, -1]), -20, 2))
+        bbox_mean = torch.nn.functional.sigmoid(self.head_bbox_mean(target_x))
+        bbox_std = torch.exp(torch.clamp(self.head_bbox_std(target_x), -20, 2))
         dist = TruncatedNormal(bbox_mean, bbox_std, 0, 1)
         log_prob += dist.log_prob(bbox).sum(1)
         enc_bb = self.bbox_encoder(bbox)

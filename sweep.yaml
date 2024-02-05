@@ -1,0 +1,50 @@
+program: run.py
+method: bayes
+metric:
+  goal: maximize
+  name: eprewmean
+parameters:
+  train:
+    parameters:
+      nenvs:
+        values: [80, 160, 320]
+      ent_coef: 
+        values: [0.01, 0.001, 0]
+      base_lr:  
+        values: [1e-4, 3e-5, 1e-5, 3e-6]
+      gamma: 
+        values: [0, 0.5, 0.9, 0.99]
+      nminibatches:
+        values: [40, 80, 160]
+      noptepochs:
+        values: [4, 8, 16]
+      cliprange:
+        values: [0.1, 0.2]
+      weight_decay:
+        values: [0, 0.01, 0.001, 0.0001]
+      first_cycle_steps:
+        values: [1000, 2000, 4000]
+      cycle_mult:
+        values: [0.8, 1.0, 1.2]
+      warmup_steps:
+        values: [250, 500, 1000]
+      ender_reward:
+        values: [True, False]
+  model:
+    parameters:
+      n_layer:
+        values: [4, 8, 12]
+      n_head:
+        values: [8, 16, 32]
+      n_embd:
+        values: [64, 128, 256]
+early_terminate:
+  type: hyperband
+  eta: 2
+  min_iter: 80
+
+command:
+  - ${env}
+  - python3
+  - ${program}
+  - ${args}

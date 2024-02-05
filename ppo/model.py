@@ -47,26 +47,31 @@ def get_train_fn(policy, optimizer, cfg):
         # Total loss
         loss = actor_loss * train_actor + entropy_loss + critic_loss + aux_loss1 + aux_loss2 + aux_loss3
 
-        loss_1 = actor_loss * train_actor + entropy_loss
-        loss_2 = critic_loss + aux_loss1 + aux_loss2 + aux_loss3
-
-        with torch.no_grad():
-            loss_1.backward(retain_graph=True)
+        if not cfg.grad_surgery:
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
-            grad_1 = policy.get_grads()
-
-            loss_2.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
-            grad_2 = policy.get_grads()
-
-            dot = torch.dot(grad_1, grad_2)
-            if dot < 0:
-                grad_1 = grad_1 + grad_2 - dot * grad_1 / (grad_1.norm() ** 2)
-            else:
-                grad_1 = grad_1 + grad_2
-
-            policy.set_grads(grad_1)
             optimizer.step()
+        else:
+            loss_1 = actor_loss * train_actor + entropy_loss
+            loss_2 = critic_loss + aux_loss1 + aux_loss2 + aux_loss3
+
+            with torch.no_grad():
+                loss_1.backward(retain_graph=True)
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                grad_1 = policy.get_grads()
+
+                loss_2.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                grad_2 = policy.get_grads()
+
+                dot = torch.dot(grad_1, grad_2)
+                if dot < 0:
+                    grad_1 = grad_1 + grad_2 - dot * grad_1 / (grad_1.norm() ** 2)
+                else:
+                    grad_1 = grad_1 + grad_2
+
+                policy.set_grads(grad_1)
+                optimizer.step()
         rets = (loss, actor_loss, critic_loss, entropy_loss, aux_loss1, aux_loss2, aux_loss3, approxkl, clipfrac)
         return [npy(each) for each in rets]
 

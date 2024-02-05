@@ -1,0 +1,47 @@
+
+seed: 1
+
+env:
+  grid_x: 5
+  grid_y: 5
+  num_colors: 10
+  num_actions: 10
+  use_arc: False
+
+train:
+  nenvs: 320
+  nsteps: 50
+  ent_coef: 0
+  base_lr: 3e-5
+  vf_coef: 5
+  aux_coef: 0.5
+  max_grad_norm: 0.5
+  gamma: 0.9
+  lam: 0.95
+  log_interval: 1
+  nminibatches: 80
+  noptepochs: 16
+  cliprange: 0.1
+  save_interval: 0
+  total_timesteps: 4000000
+  gpu_num: 1
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.95
+  cliprew: 10
+  update_actor_after: 50
+  grad_surgery: False
+  first_cycle_steps: 4000
+  cycle_mult: 0.8
+  warmup_steps: 250
+  max_mult: 10
+  scheduler_gamma: 1.0
+  ender_reward: False
+ 
+model:
+  n_layer: 12
+  n_head: 16
+  n_embd: 128
+  embd_pdrop: 0.1
+  resid_pdrop: 0.1
+  attn_pdrop: 0.1

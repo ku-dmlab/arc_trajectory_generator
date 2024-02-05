@@ -25,12 +25,12 @@ def learn(cfg, env):
 
     optimizer = policy.configure_optimizers()
     scheduler = CosineAnnealingWarmupRestarts(optimizer,
-                                          first_cycle_steps=1000,
-                                          cycle_mult=1.0,
-                                          max_lr=5e-4,
-                                          min_lr=5e-5,
-                                          warmup_steps=500,
-                                          gamma=1.0)
+                                          first_cycle_steps=tcfg.first_cycle_steps,
+                                          cycle_mult=tcfg.cycle_mult,
+                                          max_lr=tcfg.base_lr * tcfg.max_mult,
+                                          min_lr=tcfg.base_lr,
+                                          warmup_steps=tcfg.warmup_steps,
+                                          gamma=tcfg.scheduler_gamma)
     train_fn = get_train_fn(policy, optimizer, tcfg)
     act_fn = get_act_fn(policy)
 

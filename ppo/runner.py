@@ -77,7 +77,10 @@ class Runner:
         success = []
         for g, ad, a in zip(self.grid[-1], self.answer_dim[-1], self.answer[-1]):
             dist = np.mean(g[:ad[0].item(), :ad[1].item()] != a[:ad[0], :ad[1]])
-            rewards.append((dist == 0) - dist)
+            if self.cfg.train.ender_reward:
+                rewards.append((dist == 0) - dist)
+            else:
+                rewards.append(-dist)
             success.append((dist == 0))
         return np.array(rewards), np.array(success)
 
